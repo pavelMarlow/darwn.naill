@@ -170,7 +170,7 @@ async function freeSlots(env) {
     return hh * 60 + mm > nowMin + LEAD_MIN;
   });
 }
-async function createBooking(env, { userId, slotId, serviceId, name, phone, source }) {
+async function createBooking(env, { userId, slotId, serviceId, name, phone, source, promoCode, discount }) {
   const svc = await env.DB.prepare("SELECT * FROM services WHERE id=? AND active=1").bind(serviceId).first();
   if (!svc) return { ok: false, error: "service" };
   const upd = await env.DB.prepare("UPDATE slots SET status='booked' WHERE id=? AND status='free'").bind(slotId).run();
@@ -178,14 +178,25 @@ async function createBooking(env, { userId, slotId, serviceId, name, phone, sour
   const slot = await env.DB.prepare("SELECT * FROM slots WHERE id=?").bind(slotId).first();
   const u = await getUser(env, userId);
   if (phone) await env.DB.prepare("UPDATE users SET phone=? WHERE telegram_id=?").bind(phone, userId).run();
-  const r = await env.DB.prepare(
-    `INSERT INTO bookings (user_id, slot_id, service_id, service_name, price, date, time, client_name, client_phone, client_username, source)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(userId, slotId, svc.id, svc.name, svc.price, slot.date, slot.time, name, phone || "",
-    (u && u.username) || "", source).run();
+  const disc = Math.max(0, Math.min(svc.price, +discount || 0));
+  const finalPrice = svc.price - disc;
+  let r;
+  try {
+    r = await env.DB.prepare(
+      `INSERT INTO bookings (user_id, slot_id, service_id, service_name, price, date, time, client_name, client_phone, client_username, source, promo_code, discount)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(userId, slotId, svc.id, svc.name, finalPrice, slot.date, slot.time, name, phone || "",
+      (u && u.username) || "", source, promoCode || "", disc).run();
+  } catch {
+    r = await env.DB.prepare(
+      `INSERT INTO bookings (user_id, slot_id, service_id, service_name, price, date, time, client_name, client_phone, client_username, source)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(userId, slotId, svc.id, svc.name, finalPrice, slot.date, slot.time, name, phone || "",
+      (u && u.username) || "", source).run();
+  }
   const id = r.meta.last_row_id;
   await env.DB.prepare("UPDATE slots SET booking_id=? WHERE id=?").bind(id, slotId).run();
-  return { ok: true, booking: { id, service_name: svc.name, price: svc.price, duration_min: svc.duration_min, date: slot.date, time: slot.time, client_name: name, client_phone: phone, client_username: (u && u.username) || "", user_id: userId } };
+  return { ok: true, booking: { id, service_name: svc.name, price: finalPrice, old_price: svc.price, duration_min: svc.duration_min, date: slot.date, time: slot.time, client_name: name, client_phone: phone, client_username: (u && u.username) || "", user_id: userId, promo_code: promoCode || "", discount: disc } };
 }
 async function cancelBooking(env, bookingId, byAdmin) {
   const b = await env.DB.prepare("SELECT * FROM bookings WHERE id=?").bind(bookingId).first();
@@ -497,6 +508,7 @@ async function notifyAdminNewBooking(env, b) {
     `👤 Клиент: <b>${html(b.client_name)}</b> (${mention(b.client_username)})\n` +
     (b.client_phone ? `📱 Телефон: <code>${html(b.client_phone)}</code>\n` : "📱 Без номера телефона\n") +
     `💅 Услуга: ${html(b.service_name)} · ${b.price}₽\n` +
+    (b.discount ? `🎁 Скидка: −${b.discount}₽${b.promo_code ? ` (${html(b.promo_code)})` : ""}\n` : "") +
     `🗓 Когда: <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n` +
     `📲 Источник: ${b.source === "app" ? "Mini App" : "бот"}`;
   for (const id of ids) {
@@ -883,7 +895,7 @@ async function apiData(env, user) {
   const texts = await getTexts(env);
   return json({
     ok: true,
-    user: { id: user.id, first_name: user.first_name, username: user.username, phone: (u && u.phone) || "" },
+    user: { id: user.id, first_name: user.first_name, username: user.username, phone: (u && u.phone) || "", birthday: (u && u.birthday) || "" },
     services, slots, bookings, past, reviews,
     rating: { count: revAgg.n || 0, avg: revAgg.a ? Math.round(revAgg.a * 10) / 10 : 0 },
     texts: { about: texts.about_text, contacts: texts.contacts_text, promo: texts.promo_text, portfolio_url: texts.portfolio_url, master_link: texts.master_link },
@@ -919,17 +931,52 @@ async function apiBook(env, user, body) {
     return json({ ok: false, error: "Заполни имя и выбери время 🙈" }, 400);
   if (phone && !/^[+]?[\d\s\-()]{10,18}$/.test(String(phone).trim()))
     return json({ ok: false, error: "Похоже, в телефоне опечатка 🙈" }, 400);
+
+  // День рождения: сохраняем, если клиент указал (формат ДД.ММ)
+  const bday = String(body.birthday || "").trim();
+  if (bday) {
+    if (!/^(0[1-9]|[12]\d|3[01])\.(0[1-9]|1[0-2])$/.test(bday))
+      return json({ ok: false, error: "День рождения в формате ДД.ММ 🙈" }, 400);
+    try { await env.DB.prepare("UPDATE users SET birthday=? WHERE telegram_id=?").bind(bday, user.id).run(); } catch {}
+  }
+
+  // Скидка: промокод ИЛИ день рождения (промокод в приоритете)
+  const svc = await env.DB.prepare("SELECT * FROM services WHERE id=? AND active=1").bind(+service_id).first();
+  if (!svc) return json({ ok: false, error: "Услуга не найдена 🙈" }, 404);
+  let promoCode = "", discount = 0;
+  const codeIn = String(body.promo_code || "").trim().toUpperCase();
+  if (codeIn) {
+    const p = await dbAll(env, "SELECT * FROM promos WHERE code=? AND active=1", codeIn);
+    if (!p.length) return json({ ok: false, error: "Промокод не найден или истёк 😔" }, 400);
+    const pr = p[0];
+    discount = pr.kind === "percent" ? Math.round((svc.price * pr.value) / 100) : pr.value;
+    promoCode = pr.code;
+    try { await env.DB.prepare("UPDATE promos SET uses=uses+1 WHERE id=?").bind(pr.id).run(); } catch {}
+  } else {
+    const bd = await getSetting(env, "bday_discount");
+    const discPct = bd === "" ? 10 : parseInt(bd, 10);
+    const u = await getUser(env, user.id);
+    const ub = bday || (u && u.birthday) || "";
+    const todayDm = todayStr(env).slice(8, 10) + "." + todayStr(env).slice(5, 7);
+    if (discPct > 0 && ub && ub === todayDm) {
+      discount = Math.round((svc.price * discPct) / 100);
+      promoCode = "🎂 ДР";
+    }
+  }
+
   const res = await createBooking(env, {
     userId: user.id, slotId: +slot_id, serviceId: +service_id,
     name: String(name).trim().slice(0, 40), phone: phone ? String(phone).trim() : "", source: "app",
+    promoCode, discount,
   });
   if (!res.ok) return json({ ok: false, error: res.error === "slot_taken" ? "Упс, это окошко уже заняли 😔 Выбери другое!" : "Что-то пошло не так" }, 409);
   const b = res.booking;
   await notifyAdminNewBooking(env, b);
+  const priceLine = b.discount ? `💅 ${html(b.service_name)} · <s>${b.old_price}₽</s> <b>${b.price}₽</b> (скидка −${b.discount}₽)` : `💅 ${html(b.service_name)} · ${b.price}₽`;
   await send(env, user.id,
-    `🎉 <b>Ты записана!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\n⏳ Подтвержу запись в ближайшее время 💌\n📍 Адрес: г. Бердск, ул. Вокзальная, 2`,
+    `🎉 <b>Ты записана!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n${priceLine}\n\n⏳ Подтвержу запись в ближайшее время 💌\n📍 Адрес: г. Бердск, ул. Вокзальная, 2`,
     { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))], [urlBtn("🧭 Как добраться", MAPS_URL)]]) });
-  return json({ ok: true, booking: { id: b.id, date: b.date, time: b.time, service_name: b.service_name, price: b.price, date_label: dateLabel(b.date) } });
+  return json({ ok: true, booking: { id: b.id, date: b.date, time: b.time, service_name: b.service_name, price: b.price, old_price: b.old_price, discount: b.discount, date_label: dateLabel(b.date) } });
 }
 
 async function apiCancel(env, user, body) {
@@ -956,16 +1003,48 @@ async function apiAdmin(env, path, body) {
     ).bind(today).all()).results || [];
     const services = (await env.DB.prepare("SELECT * FROM services ORDER BY sort, id").all()).results || [];
     const reviews = await dbAll(env, "SELECT * FROM reviews ORDER BY id DESC LIMIT 50");
+    const promos = await dbAll(env, "SELECT * FROM promos ORDER BY id DESC LIMIT 50");
     const texts = await getTexts(env);
     const one = async (q, ...b) => (await env.DB.prepare(q).bind(...b).first()).n;
-    return json({ ok: true, today, bookings, slots, services, reviews, texts, stats: {
+    const settings = { rebook_days: (await getSetting(env, "rebook_days")) || "21", bday_discount: (await getSetting(env, "bday_discount")) || "10" };
+    let months = [], topServices = [], returning = 0;
+    try { months = await dbAll(env, "SELECT substr(date,1,7) ym, COALESCE(SUM(price),0) total, COUNT(*) cnt FROM bookings WHERE status='confirmed' GROUP BY ym ORDER BY ym DESC LIMIT 6"); } catch {}
+    try { topServices = await dbAll(env, "SELECT service_name, COUNT(*) cnt FROM bookings WHERE status='confirmed' GROUP BY service_name ORDER BY cnt DESC LIMIT 5"); } catch {}
+    try { returning = await one("SELECT COUNT(*) n FROM (SELECT user_id FROM bookings WHERE status='confirmed' GROUP BY user_id HAVING COUNT(*)>1)"); } catch {}
+    return json({ ok: true, today, bookings, slots, services, reviews, promos, texts, settings, stats: {
       users: await one("SELECT COUNT(*) n FROM users"),
       upcoming: await one("SELECT COUNT(*) n FROM bookings WHERE status IN ('pending','confirmed') AND date>=?", today),
       pending: await one("SELECT COUNT(*) n FROM bookings WHERE status='pending' AND date>=?", today),
       free_slots: await one("SELECT COUNT(*) n FROM slots WHERE status='free' AND date>=?", today),
       revenue: await one("SELECT COALESCE(SUM(price),0) n FROM bookings WHERE status='confirmed' AND date>=?", today),
       new_reviews: reviews.filter((r) => r.visible).length,
+      months, topServices, returning,
     }});
+  }
+  if (path === "/api/admin/promo") {
+    if (body.action === "add") {
+      const code = String(body.code || "").trim().toUpperCase();
+      if (!/^[A-ZА-Я0-9]{3,20}$/.test(code)) return json({ ok: false, error: "Код: 3–20 букв/цифр 🙈" }, 400);
+      const kind = body.kind === "fixed" ? "fixed" : "percent";
+      const value = Math.max(1, Math.min(kind === "percent" ? 90 : 10000, parseInt(body.value, 10) || 0));
+      if (!value) return json({ ok: false, error: "Укажи размер скидки 🙈" }, 400);
+      try {
+        await env.DB.prepare("INSERT INTO promos (code, kind, value) VALUES (?,?,?)").bind(code, kind, value).run();
+      } catch { return json({ ok: false, error: "Такой код уже есть 🙈" }, 409); }
+      return json({ ok: true });
+    }
+    const id = +body.id;
+    if (body.action === "del") await env.DB.prepare("DELETE FROM promos WHERE id=?").bind(id).run();
+    else await env.DB.prepare("UPDATE promos SET active=? WHERE id=?").bind(body.action === "on" ? 1 : 0, id).run();
+    return json({ ok: true });
+  }
+  if (path === "/api/admin/settings") {
+    const allowed = { rebook_days: [7, 60], bday_discount: [0, 50] };
+    const key = String(body.key || "");
+    if (!(key in allowed)) return json({ ok: false, error: "unknown_key" }, 400);
+    const v = Math.max(allowed[key][0], Math.min(allowed[key][1], parseInt(body.value, 10) || 0));
+    await env.DB.prepare("INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, String(v)).run();
+    return json({ ok: true, value: v });
   }
   if (path === "/api/admin/booking") {
     const b = await env.DB.prepare("SELECT * FROM bookings WHERE id=?").bind(+body.id).first();
@@ -1240,7 +1319,9 @@ if (tg) { tg.ready(); tg.expand(); try { tg.setHeaderColor('#14090f'); tg.setBac
 var D = null;          // данные с сервера
 var view = 'home';     // home | book | done | my | contacts
 var sel = { svc:null, date:null, slotId:null, time:null };
-var form = { name:'', phone:'' };
+var form = { name:'', phone:'', bday:'' };
+var promo = null;      // применённый промокод {code,kind,value}
+var pmKind = 'percent'; // тип нового промокода в админке
 var sending = false;
 var AD = null;          // данные админки
 var admSlotDate = null; // выбранная дата в добавлении окошка
@@ -1325,6 +1406,8 @@ function render(){
   else if (view==='adm_tx_edit') html = viewAdminTxEdit();
   else if (view==='adm_sl_gen') html = viewAdminSlGen();
   else if (view==='adm_rv') html = viewAdminRv();
+  else if (view==='adm_pm') html = viewAdminPm();
+  else if (view==='adm_st') html = viewAdminSt();
   else if (view==='review') html = viewReview();
   else if (view==='adm_bc') html = viewAdminBc();
   $('app').innerHTML = '<div class="fade">'+html+'</div>';
@@ -1473,6 +1556,14 @@ function viewBook(){
     s += '<div class="sect">Как к тебе обращаться?</div>';
     s += '<input class="inp" id="inName" placeholder="Имя" value="'+h(form.name)+'" oninput="form.name=this.value;updCta()">';
     s += '<input class="inp" id="inPhone" placeholder="Телефон (по желанию)" value="'+h(form.phone)+'" oninput="form.phone=this.value;updCta()">';
+    if (promo) {
+      s += '<div class="card" style="display:flex;justify-content:space-between;align-items:center"><span>🎁 <b>'+h(promo.code)+'</b> · скидка '+(promo.kind==='percent'?promo.value+'%':promo.value+'₽')+'</span><span style="cursor:pointer;opacity:.6;padding:4px 8px" onclick="promo=null;render()">✕</span></div>';
+    } else {
+      s += '<div style="display:flex;gap:8px;align-items:stretch"><input class="inp" id="inPromo" placeholder="Промокод (если есть)" value="'+h(form.promo)+'" style="flex:1" oninput="form.promo=this.value"><button class="abtn" style="padding:0 18px" onclick="applyPromo()">ОК</button></div>';
+    }
+    if (!D.user.birthday) {
+      s += '<input class="inp" id="inBday" placeholder="🎂 День рождения ДД.ММ — в ДР будет скидка!" value="'+h(form.bday)+'" oninput="form.bday=this.value">';
+    }
   }
   s += '<div style="height:76px"></div>';
   return s;
@@ -1483,7 +1574,7 @@ function viewDone(){
   var f = fmtDateLabel(b.date);
   return '<div class="ok-screen"><div class="chk">🎉</div>' +
     '<h2 style="font-size:22px">Ты записана!</h2>' +
-    '<p style="color:var(--muted);margin-top:10px;font-size:15px">'+f.dd+' '+f.mo+' в '+b.time+'<br>'+h(b.service_name)+' · '+b.price+'₽</p>' +
+    '<p style="color:var(--muted);margin-top:10px;font-size:15px">'+f.dd+' '+f.mo+' в '+b.time+'<br>'+h(b.service_name)+' · '+(b.discount?'<s>'+b.old_price+'₽</s> ':'')+b.price+'₽'+(b.discount?' (скидка −'+b.discount+'₽)':'')+'</p>' +
     '<p style="color:var(--muted);margin-top:14px;font-size:13px">Дарина подтвердит запись 💌<br>📍 г. Бердск, ул. Вокзальная, 2</p>' +
     '<a class="linkbtn" style="margin-top:22px" href="https://yandex.ru/maps/?text=%D0%B3.%20%D0%91%D0%B5%D1%80%D0%B4%D1%81%D0%BA%2C%20%D1%83%D0%BB.%20%D0%92%D0%BE%D0%BA%D0%B7%D0%B0%D0%BB%D1%8C%D0%BD%D0%B0%D1%8F%2C%202" target="_blank" rel="noopener">🧭 Как добраться</a>' +
     '<a class="linkbtn" href="#" onclick="go(\'my\');return false;">📅 Мои записи</a>' +
@@ -1493,9 +1584,25 @@ function viewDone(){
 function renderCta(){
   var c = $('cta');
   if (view==='book' && sel.slotId) {
-    c.innerHTML = '<button id="ctaBtn" onclick="submitBook()">✨ Записаться · '+sel.svc.price+'₽</button>';
+    c.innerHTML = '<button id="ctaBtn" onclick="submitBook()">✨ Записаться · '+(promo?'<s style="opacity:.6">'+sel.svc.price+'₽</s> ':'')+curPrice()+'₽</button>';
     updCta();
   } else c.innerHTML = '';
+}
+function curPrice(){
+  if (!sel.svc) return 0;
+  if (promo) {
+    var d = promo.kind==='percent' ? Math.round(sel.svc.price*promo.value/100) : promo.value;
+    return Math.max(0, sel.svc.price - d);
+  }
+  return sel.svc.price;
+}
+function applyPromo(){
+  var code = form.promo.trim();
+  if (!code) { toast('Введи промокод 🙈'); return; }
+  apiPost('/api/promo/check', { code: code }).then(function(d){
+    if (d.ok) { promo = { code: code.toUpperCase(), kind: d.kind, value: d.value }; haptic('medium'); toast('🎁 Промокод применён!'); render(); }
+    else toast(d.error || 'Не подошёл 😔');
+  });
 }
 function validPhone(p){ return /^[+]?[\d\s\-()]{10,18}$/.test(String(p||'').trim()); }
 function updCta(){
@@ -1516,18 +1623,20 @@ function submitBook(){
   if (sending) return;
   if (form.name.trim().length < 1) { toast('Напиши имя 🙈'); return; }
   if (form.phone.trim() && !validPhone(form.phone)) { toast('Похоже, в телефоне опечатка 🙈'); return; }
+  if (form.bday.trim() && !/^(0[1-9]|[12]\d|3[01])\.(0[1-9]|1[0-2])$/.test(form.bday.trim())) { toast('День рождения: ДД.ММ, напр. 15.03 🙈'); return; }
   sending = true; updCta();
   haptic('heavy');
   var headers = { 'content-type':'application/json' };
   if (tg && tg.initData) headers['X-Tg-Init-Data'] = tg.initData;
   fetch('__API__/api/book', {
     method:'POST', headers: headers,
-    body: JSON.stringify({ slot_id: sel.slotId, service_id: sel.svc.id, name: form.name.trim(), phone: form.phone.trim() })
+    body: JSON.stringify({ slot_id: sel.slotId, service_id: sel.svc.id, name: form.name.trim(), phone: form.phone.trim(), promo_code: promo ? promo.code : '', birthday: form.bday.trim() })
   }).then(function(r){ return r.json().then(function(j){ return { status:r.status, j:j }; }); })
     .then(function(res){
       sending = false;
       if (res.j.ok) {
         try { if(tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success'); } catch(e){}
+        promo = null;
         window._done = res.j.booking;
         view='done';
         refreshData(false);
@@ -1582,7 +1691,34 @@ function viewAdmin(){
   s += '<div class="card menurow" onclick="go(\'adm_tx\')">✏️ Тексты<span style="color:var(--muted)">→</span></div>';
   s += '<div class="card menurow" onclick="go(\'adm_bc\')">📣 Рассылка<span style="color:var(--muted)">→</span></div>';
   s += '<div class="card menurow" onclick="go(\'adm_rv\')">⭐ Отзывы'+(st.new_reviews?'<span class="badge">'+st.new_reviews+'</span>':'<span style="color:var(--muted)">→</span>')+'</div>';
+  s += '<div class="card menurow" onclick="go(\'adm_pm\')">🎁 Промокоды<span style="color:var(--muted)">→</span></div>';
+  s += '<div class="card menurow" onclick="go(\'adm_st\')">⚙️ Настройки<span style="color:var(--muted)">→</span></div>';
+  if (st.months && st.months.length) {
+    var mx = 1;
+    for (var mi=0;mi<st.months.length;mi++) mx = Math.max(mx, st.months[mi].total);
+    s += '<div class="sect">Выручка по месяцам</div><div class="card">';
+    for (var mi2=0;mi2<st.months.length;mi2++){
+      var mo = st.months[mi2];
+      var pct = Math.max(4, Math.round(mo.total/mx*100));
+      s += '<div style="margin:10px 0"><div style="display:flex;justify-content:space-between;font-size:13px"><span style="color:var(--muted)">'+monthLabel(mo.ym)+' · '+mo.cnt+' зап.</span><b>'+mo.total+'₽</b></div><div style="height:6px;background:rgba(255,255,255,.06);border-radius:3px;margin-top:5px"><div style="height:6px;width:'+pct+'%;background:var(--accent);border-radius:3px"></div></div></div>';
+    }
+    s += '</div>';
+  }
+  if (st.topServices && st.topServices.length) {
+    s += '<div class="sect">Топ услуг</div><div class="card">';
+    for (var ti=0;ti<st.topServices.length;ti++){
+      var ts = st.topServices[ti];
+      s += '<div style="display:flex;justify-content:space-between;font-size:14px;margin:7px 0"><span>'+(ti+1)+'. '+h(ts.service_name)+'</span><b>'+ts.cnt+'</b></div>';
+    }
+    s += '</div>';
+  }
+  if (st.returning) s += '<div style="text-align:center;color:var(--muted);font-size:13px;margin-top:6px">🔁 постоянных клиентов: <b style="color:var(--accent)">'+st.returning+'</b> (2+ визита)</div>';
   return s;
+}
+function monthLabel(ym){
+  var M = ['Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'];
+  var p = String(ym).split('-');
+  return (M[+p[1]-1] || ym) + ' ' + p[0];
 }
 
 function viewAdminBk(){
@@ -1743,6 +1879,67 @@ function admReview(id, action){
   haptic();
   apiPost('/api/admin/review', { id:id, action:action }).then(function(d){
     if (d.ok) { toast(action==='del'?'🗑 Удалён':'Готово ✨'); refreshAdmin(); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+
+function viewAdminPm(){
+  var s = admHead('Промокоды');
+  s += '<div class="card">';
+  s += '<input class="inp" id="pmCode" placeholder="Код, напр. PODRUGA10" style="margin-top:0">';
+  s += '<div class="times" style="margin-top:10px">';
+  s += '<div class="tchip'+(pmKind==='percent'?' active':'')+'" onclick="pmKind=\'percent\';render()">% проценты</div>';
+  s += '<div class="tchip'+(pmKind==='fixed'?' active':'')+'" onclick="pmKind=\'fixed\';render()">₽ рубли</div>';
+  s += '</div>';
+  s += '<input class="inp" id="pmVal" inputmode="numeric" placeholder="'+(pmKind==='percent'?'Скидка % (1–90)':'Скидка в ₽')+'">';
+  s += '<button class="abtn ok" style="width:100%" onclick="admPromoAdd()">➕ Создать промокод</button>';
+  s += '</div>';
+  if (!AD.promos || !AD.promos.length) s += '<div class="empty">Промокодов нет 🤍</div>';
+  for (var i=0;i<(AD.promos||[]).length;i++){
+    var p = AD.promos[i];
+    s += '<div class="card"'+(p.active?'':' style="opacity:.45"')+'><div class="bk"><div><b>'+h(p.code)+'</b><div class="ds" style="color:var(--muted);font-size:13px;margin-top:4px">скидка −'+(p.kind==='percent'?p.value+'%':p.value+'₽')+' · использован '+p.uses+'×</div></div></div>';
+    s += '<div style="display:flex;gap:8px;margin-top:10px">';
+    s += '<button class="abtn" style="flex:1;padding:9px 0;font-size:13px" onclick="admPromo('+p.id+',\''+(p.active?'off':'on')+'\')">'+(p.active?'💤 Выкл':'✨ Вкл')+'</button>';
+    s += '<button class="abtn no" style="flex:1;padding:9px 0;font-size:13px" onclick="admPromo('+p.id+',\'del\')">🗑</button>';
+    s += '</div></div>';
+  }
+  return s;
+}
+function admPromoAdd(){
+  var code = ($('pmCode')?$('pmCode').value:'').trim();
+  var value = parseInt(($('pmVal')?$('pmVal').value:''), 10) || 0;
+  if (code.length < 3) { toast('Код от 3 символов 🙈'); return; }
+  if (!value) { toast('Укажи скидку 🙈'); return; }
+  haptic('medium');
+  apiPost('/api/admin/promo', { action:'add', code:code, kind:pmKind, value:value }).then(function(d){
+    if (d.ok) { toast('🎁 Промокод создан'); refreshAdmin(); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+function admPromo(id, action){
+  if (action==='del' && !confirm('Удалить промокод?')) return;
+  haptic();
+  apiPost('/api/admin/promo', { id:id, action:action }).then(function(d){
+    if (d.ok) { toast(action==='del'?'🗑 Удалён':'Готово ✨'); refreshAdmin(); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+
+function viewAdminSt(){
+  var st = AD.settings || { rebook_days:'21', bday_discount:'10' };
+  var s = admHead('Настройки');
+  s += '<div class="card"><b style="font-size:14px">🔁 Приглашение на повторный визит</b>';
+  s += '<div style="color:var(--muted);font-size:13px;margin:6px 0 10px;line-height:1.5">Через сколько дней после визита бот предложит клиенту записаться снова (7–60)</div>';
+  s += '<div style="display:flex;gap:8px"><input class="inp" id="stRebook" inputmode="numeric" style="flex:1;margin-top:0" value="'+h(st.rebook_days)+'"><button class="abtn ok" style="padding:0 18px" onclick="admSettingSave(\'rebook_days\', $(\'stRebook\').value)">💾</button></div></div>';
+  s += '<div class="card"><b style="font-size:14px">🎂 Скидка в день рождения</b>';
+  s += '<div style="color:var(--muted);font-size:13px;margin:6px 0 10px;line-height:1.5">Процент скидки при записи в ДР (0 — выкл, макс 50). Утром в ДР клиенту приходит поздравление</div>';
+  s += '<div style="display:flex;gap:8px"><input class="inp" id="stBday" inputmode="numeric" style="flex:1;margin-top:0" value="'+h(st.bday_discount)+'"><button class="abtn ok" style="padding:0 18px" onclick="admSettingSave(\'bday_discount\', $(\'stBday\').value)">💾</button></div></div>';
+  return s;
+}
+function admSettingSave(key, value){
+  haptic();
+  apiPost('/api/admin/settings', { key:key, value:value }).then(function(d){
+    if (d.ok) { toast('💾 Сохранено'); refreshAdmin(); }
     else toast(d.error || 'Ошибка 😔');
   });
 }
@@ -2603,6 +2800,12 @@ export default {
         return apiCancel(env, user, await request.json().catch(() => ({})));
       if (url.pathname === "/api/review" && request.method === "POST")
         return apiReview(env, user, await request.json().catch(() => ({})));
+      if (url.pathname === "/api/promo/check" && request.method === "POST") {
+        const { code } = (await request.json().catch(() => ({}))) || {};
+        const rows = await dbAll(env, "SELECT kind, value FROM promos WHERE code=? AND active=1", String(code || "").trim().toUpperCase());
+        if (!rows.length) return json({ ok: false, error: "Промокод не найден или истёк 😔" }, 404);
+        return json({ ok: true, kind: rows[0].kind, value: rows[0].value });
+      }
       return json({ ok: false, error: "not_found" }, 404);
     }
 
@@ -2646,6 +2849,19 @@ export default {
         )`,
         "ALTER TABLE bookings ADD COLUMN review_asked INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE bookings ADD COLUMN reminded2 INTEGER NOT NULL DEFAULT 0",
+        `CREATE TABLE IF NOT EXISTS promos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          code TEXT NOT NULL UNIQUE,
+          kind TEXT NOT NULL DEFAULT 'percent',
+          value INTEGER NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          uses INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        "ALTER TABLE users ADD COLUMN birthday TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE bookings ADD COLUMN promo_code TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE bookings ADD COLUMN discount INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE bookings ADD COLUMN rebook_invited INTEGER NOT NULL DEFAULT 0",
       ];
       const mig = [];
       for (const sql of MIGRATIONS) {
@@ -2704,6 +2920,40 @@ export default {
           }
         }
       } catch (e) { console.log("remind2", String(e)); }
+
+      // 1.5) Приглашение на повторный визит (по умолчанию через 21 день)
+      if (nowL.getUTCHours() === 12 && nowL.getUTCMinutes() < 15) {
+        try {
+          const rebookDays = parseInt(await getSetting(env, "rebook_days"), 10) || 21;
+          const target = addDays(today, -rebookDays);
+          const due = await dbAll(env, "SELECT * FROM bookings WHERE date=? AND status='confirmed' AND rebook_invited=0", target);
+          const appUrlR = await getSetting(env, "app_url");
+          for (const b of due) {
+            const extra = appUrlR ? { reply_markup: kb([[webBtn("💅 Выбрать время", appUrlR + "/app")]]) } : {};
+            const r = await send(env, b.user_id,
+              `💅 <b>Прошло уже ${rebookDays} дн. с твоего визита!</b>\n\nНоготки наверняка просят обновления ✨ Запишись, пока есть свободные окошки 🤍`, extra);
+            if (r.ok) await env.DB.prepare("UPDATE bookings SET rebook_invited=1 WHERE id=?").bind(b.id).run();
+          }
+        } catch (e) { console.log("rebook", String(e)); }
+      }
+
+      // 1.6) Поздравления с днём рождения (02:00 UTC = 09:00 Нск)
+      if (nowL.getUTCHours() === 2 && nowL.getUTCMinutes() < 15) {
+        try {
+          const dm = today.slice(8, 10) + "." + today.slice(5, 7);
+          const bdRaw = await getSetting(env, "bday_discount");
+          const bdisc = bdRaw === "" ? 10 : parseInt(bdRaw, 10);
+          const bdays = await dbAll(env, "SELECT telegram_id, first_name FROM users WHERE birthday=?", dm);
+          const appUrlB = await getSetting(env, "app_url");
+          for (const u of bdays) {
+            const extra = appUrlB ? { reply_markup: kb([[webBtn("💅 Записаться", appUrlB + "/app")]]) } : {};
+            await send(env, u.telegram_id,
+              `🎂 <b>С днём рождения, ${html(u.first_name)}!</b> 🎉\n\nДарина поздравляет от души 🤍` +
+              (bdisc > 0 ? `\nПодарок: <b>скидка ${bdisc}%</b> на любую услугу — просто запишись сегодня, она применится сама ✨` : "\n\nОбнимаем! ✨"),
+              extra);
+          }
+        } catch (e) { console.log("bday", String(e)); }
+      }
 
       // 3) Просим отзыв через ~2 часа после визита
       try {
