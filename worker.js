@@ -1067,7 +1067,8 @@ const MINI_APP_HTML = String.raw`<!DOCTYPE html>
   .bk .st { font-size:11px; font-weight:700; padding:4px 10px; border-radius:20px; }
   .st.p { background:rgba(242,184,198,.15); color:var(--accent1); border:1px solid rgba(242,184,198,.35); }
   .st.c { background:rgba(151,224,173,.12); color:#97e0ad; border:1px solid rgba(151,224,173,.3); }
-  .bk .cancel { font-size:12px; color:var(--red); background:none; border:1px solid rgba(255,143,163,.35); border-radius:20px; padding:6px 12px; cursor:pointer; margin-top:8px; }
+  .cancel { display:block; width:100%; font-size:13px; font-weight:600; color:var(--red); background:rgba(255,143,163,.07); border:1px solid rgba(255,143,163,.35); border-radius:13px; padding:11px 12px; cursor:pointer; margin-top:12px; transition:.15s; }
+  .cancel:active { transform:scale(.98); background:rgba(255,143,163,.14); }
 
   .linkbtn { display:block; text-align:center; padding:14px; border-radius:15px; background:var(--card); border:1px solid var(--card-border); color:var(--text); text-decoration:none; font-weight:600; font-size:14.5px; margin-top:10px; }
   .back { color:var(--muted); font-size:14px; cursor:pointer; padding:6px 0; display:inline-block; }
@@ -1103,7 +1104,7 @@ const MINI_APP_HTML = String.raw`<!DOCTYPE html>
 <div class="wrap" id="app">
   <div class="skel"></div><div class="skel"></div><div class="skel"></div>
 </div>
-<div id="cta"></div>
+<div id="cta" class="cta"></div>
 
 <script>
 var tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
@@ -2304,7 +2305,7 @@ export default {
     // Mini App
     if (url.pathname === "/app") {
       return new Response(MINI_APP_HTML.replaceAll("__API__", origin).replaceAll("__TG_SCRIPT__", TG_SCRIPT), {
-        headers: { "content-type": "text/html; charset=utf-8" },
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
       });
     }
 
