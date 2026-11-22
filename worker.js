@@ -1,0 +1,1299 @@
+/**
+ * ═══════════════════════════════════════════════════════════
+ *  💅 DARWN.NAILL — Telegram-бот + Mini App для nail-мастера
+ *  Мастер: Дарина · стаж 3 года
+ *  Один файл: бот + админка + Mini App + API + БД (Cloudflare D1)
+ * ═══════════════════════════════════════════════════════════
+ *
+ *  Биндинги (wrangler.toml):
+ *   • BOT_TOKEN        — secret (wrangler secret put BOT_TOKEN)
+ *   • DB               — D1 database
+ *   • ADMIN_ID         — твой telegram id (можно несколько через запятую)
+ *   • WEBHOOK_SECRET   — любая случайная строка для вебхука
+ *   • TZ_OFFSET_HOURS  — смещение часового пояса (по умолчанию 7, Новосибирск)
+ */
+
+// ────────────────────────── ТЕКСТЫ ПО УМОЛЧАНИЮ ──────────────────────────
+const DEFAULT_TEXTS = {
+  start_text:
+    "✨ <b>DARWN.NAILL</b> ✨\n\n" +
+    "Привет, <b>{name}</b>! 🤍\n" +
+    "Я — бот Дарины, мастера маникюра.\n\n" +
+    "Здесь ты можешь посмотреть услуги и записаться на ногти мечты за минуту ⚡️",
+  about_text:
+    "🤍 <b>Дарина · nail-мастер</b>\n\n" +
+    "✦ Стаж работы — 3 года\n" +
+    "✦ Стерильность: крафт-пакеты + автоклав\n" +
+    "✦ Только качественные материалы\n" +
+    "✦ Уютная атмосфера и вкусный кофе ☕️\n\n" +
+    "<i>Делаю ногти, с которыми хочется жить 💅</i>",
+  contacts_text:
+    "📍 <b>Контакты</b>\n\n" +
+    "Точный адрес отправлю после подтверждения записи 💌\n" +
+    "По любым вопросам — жми кнопку ниже, я на связи:",
+  promo_text: "",
+  portfolio_url: "",
+  master_link: "https://t.me/",
+};
+
+const WEEKDAYS_SHORT = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"];
+const MONTHS_GEN = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
+const TIME_PRESETS = ["09:00","10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00","20:00"];
+const DAYS_AHEAD = 14;
+const LEAD_MIN = 60; // за сколько минут до начала окошко закрывается
+
+// ────────────────────────── УТИЛИТЫ ──────────────────────────
+const html = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const kb = (rows) => ({ inline_keyboard: rows });
+const btn = (text, data) => ({ text, callback_data: data });
+const urlBtn = (text, url) => ({ text, url });
+const webBtn = (text, url) => ({ text, web_app: { url } });
+const pad2 = (n) => String(n).padStart(2, "0");
+
+function nowLocal(env) {
+  const off = parseInt(env.TZ_OFFSET_HOURS || "7", 10);
+  return new Date(Date.now() + off * 3600_000); // «локальное» время в UTC-полях
+}
+function todayStr(env) {
+  const d = nowLocal(env);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+function nowMinutes(env) {
+  const d = nowLocal(env);
+  return d.getUTCHours() * 60 + d.getUTCMinutes();
+}
+function addDays(dateStr, n) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + n));
+  return `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+}
+function dateLabel(dateStr) { // "Сб · 23 ноября"
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return `${WEEKDAYS_SHORT[dt.getUTCDay()]} · ${d} ${MONTHS_GEN[m - 1]}`;
+}
+function shortDate(dateStr) {
+  const [, m, d] = dateStr.split("-");
+  return `${d}.${m}`;
+}
+function mention(username, name) {
+  return username ? `@${username}` : (name || "без юзернейма");
+}
+function gcalLink(env, b) {
+  const off = parseInt(env.TZ_OFFSET_HOURS || "7", 10);
+  const [y, m, d] = b.date.split("-").map(Number);
+  const [hh, mm] = b.time.split(":").map(Number);
+  const start = new Date(Date.UTC(y, m - 1, d, hh - off, mm));
+  const end = new Date(start.getTime() + (b.duration_min || 120) * 60000);
+  const f = (x) => x.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  return "https://calendar.google.com/calendar/render?action=TEMPLATE" +
+    "&text=" + encodeURIComponent("💅 Маникюр · Дарина") +
+    "&dates=" + f(start) + "/" + f(end) +
+    "&details=" + encodeURIComponent(`${b.service_name} · ${b.price}₽`);
+}
+
+// ────────────────────────── TELEGRAM API ──────────────────────────
+async function tg(env, method, payload) {
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const j = await r.json().catch(() => ({ ok: false }));
+    if (!j.ok) console.log("TG error", method, JSON.stringify(j).slice(0, 300));
+    return j;
+  } catch (e) {
+    console.log("TG fetch fail", method, String(e));
+    return { ok: false };
+  }
+}
+const send = (env, chat, text, extra = {}) =>
+  tg(env, "sendMessage", { chat_id: chat, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra });
+const answer = (env, id, text, alert = false) =>
+  tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert: alert });
+
+async function show(env, c, screen) {
+  const extra = screen.keyboard ? { reply_markup: kb(screen.keyboard) } : {};
+  if (c.messageId) {
+    const r = await tg(env, "editMessageText", {
+      chat_id: c.chatId, message_id: c.messageId, text: screen.text,
+      parse_mode: "HTML", disable_web_page_preview: true, ...extra,
+    });
+    if (r.ok) return;
+    if (r.description && r.description.includes("not modified")) return;
+  }
+  await send(env, c.chatId, screen.text, extra);
+}
+
+// ────────────────────────── БД: ХЕЛПЕРЫ ──────────────────────────
+async function upsertUser(env, from) {
+  await env.DB.prepare(
+    `INSERT INTO users (telegram_id, username, first_name) VALUES (?,?,?)
+     ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name`
+  ).bind(from.id, from.username || null, from.first_name || "").run();
+}
+async function getUser(env, id) {
+  return env.DB.prepare("SELECT * FROM users WHERE telegram_id=?").bind(id).first();
+}
+async function setState(env, id, state, payload = {}) {
+  await env.DB.prepare("UPDATE users SET state=?, payload=? WHERE telegram_id=?")
+    .bind(state, JSON.stringify(payload), id).run();
+}
+async function getSetting(env, key) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key=?").bind(key).first();
+  return row ? row.value : (DEFAULT_TEXTS[key] ?? "");
+}
+async function getTexts(env) {
+  const { results } = await env.DB.prepare("SELECT key, value FROM settings").all();
+  const map = { ...DEFAULT_TEXTS };
+  for (const r of results || []) map[r.key] = r.value;
+  return map;
+}
+function isAdmin(env, id) {
+  return (env.ADMIN_ID || "").split(",").map((s) => s.trim()).filter(Boolean).includes(String(id));
+}
+async function freeSlots(env) {
+  const today = todayStr(env);
+  const { results } = await env.DB.prepare(
+    "SELECT id, date, time FROM slots WHERE status='free' AND date>=? ORDER BY date, time"
+  ).bind(today).all();
+  const nowMin = nowMinutes(env);
+  return (results || []).filter((s) => {
+    if (s.date !== today) return true;
+    const [hh, mm] = s.time.split(":").map(Number);
+    return hh * 60 + mm > nowMin + LEAD_MIN;
+  });
+}
+async function createBooking(env, { userId, slotId, serviceId, name, phone, source }) {
+  const svc = await env.DB.prepare("SELECT * FROM services WHERE id=? AND active=1").bind(serviceId).first();
+  if (!svc) return { ok: false, error: "service" };
+  const upd = await env.DB.prepare("UPDATE slots SET status='booked' WHERE id=? AND status='free'").bind(slotId).run();
+  if (!upd.meta || !upd.meta.changes) return { ok: false, error: "slot_taken" };
+  const slot = await env.DB.prepare("SELECT * FROM slots WHERE id=?").bind(slotId).first();
+  const u = await getUser(env, userId);
+  if (phone) await env.DB.prepare("UPDATE users SET phone=? WHERE telegram_id=?").bind(phone, userId).run();
+  const r = await env.DB.prepare(
+    `INSERT INTO bookings (user_id, slot_id, service_id, service_name, price, date, time, client_name, client_phone, client_username, source)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(userId, slotId, svc.id, svc.name, svc.price, slot.date, slot.time, name, phone || "",
+    (u && u.username) || "", source).run();
+  const id = r.meta.last_row_id;
+  await env.DB.prepare("UPDATE slots SET booking_id=? WHERE id=?").bind(id, slotId).run();
+  return { ok: true, booking: { id, service_name: svc.name, price: svc.price, duration_min: svc.duration_min, date: slot.date, time: slot.time, client_name: name, client_phone: phone, client_username: (u && u.username) || "", user_id: userId } };
+}
+async function cancelBooking(env, bookingId, byAdmin) {
+  const b = await env.DB.prepare("SELECT * FROM bookings WHERE id=?").bind(bookingId).first();
+  if (!b || b.status === "cancelled") return null;
+  await env.DB.prepare("UPDATE bookings SET status='cancelled' WHERE id=?").bind(bookingId).run();
+  if (b.slot_id) await env.DB.prepare("UPDATE slots SET status='free', booking_id=NULL WHERE id=?").bind(b.slot_id).run();
+  return b;
+}
+
+// ────────────────────────── ЭКРАНЫ: КЛИЕНТ ──────────────────────────
+async function screenMain(env, name, appUrl) {
+  const t = await getTexts(env);
+  const rows = [
+    [webBtn("✨ Записаться онлайн", appUrl + "/app")],
+    [btn("💅 Услуги и цены", "sv"), btn("📅 Мои записи", "my")],
+  ];
+  if (t.promo_text) rows.push([btn("🔥 Акция", "promo")]);
+  rows.push([btn("🤍 О мастере", "ab"), btn("📍 Контакты", "ct")]);
+  return { text: t.start_text.replace("{name}", html(name)), keyboard: rows };
+}
+async function screenServices(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM services WHERE active=1 ORDER BY sort, id").all();
+  if (!results || !results.length) return { text: "💅 <b>Услуги</b>\n\nПока пусто, загляни позже 🤍", keyboard: [[btn("⬅️ В меню", "m")]] };
+  let text = "💅 <b>Услуги и цены</b>\n\n";
+  const rows = [];
+  for (const s of results) {
+    text += `✦ <b>${html(s.name)}</b> — ${s.price}₽\n`;
+    rows.push([btn(`${s.name} · ${s.price}₽`, `sv:${s.id}`)]);
+  }
+  text += "\n<i>Нажми на услугу, чтобы узнать подробности 👇</i>";
+  rows.push([btn("⬅️ В меню", "m")]);
+  return { text, keyboard: rows };
+}
+async function screenService(env, id, appUrl) {
+  const s = await env.DB.prepare("SELECT * FROM services WHERE id=?").bind(id).first();
+  if (!s) return screenServices(env);
+  const h = Math.floor(s.duration_min / 60), m = s.duration_min % 60;
+  const dur = (h ? `${h} ч` : "") + (m ? ` ${m} мин` : "");
+  return {
+    text: `💅 <b>${html(s.name)}</b>\n\n` +
+      (s.description ? `<blockquote>${html(s.description)}</blockquote>\n` : "") +
+      `💰 Цена: <b>${s.price}₽</b>\n⏱ Длительность: ~${dur.trim()}\n\n` +
+      `<i>Запись — через Mini App, это займёт минуту ⚡️</i>`,
+    keyboard: [
+      [webBtn("✨ Записаться на эту услугу", appUrl + "/app")],
+      [btn("⬅️ К услугам", "sv"), btn("🏠 В меню", "m")],
+    ],
+  };
+}
+async function screenAbout(env, appUrl) {
+  const t = await getTexts(env);
+  const rows = [];
+  if (t.portfolio_url) rows.push([urlBtn("🖼 Портфолио", t.portfolio_url)]);
+  rows.push([webBtn("✨ Записаться", appUrl + "/app")]);
+  rows.push([btn("⬅️ В меню", "m")]);
+  return { text: t.about_text, keyboard: rows };
+}
+async function screenContacts(env) {
+  const t = await getTexts(env);
+  const rows = [];
+  if (t.master_link) rows.push([urlBtn("💬 Написать Дарине", t.master_link)]);
+  if (t.portfolio_url) rows.push([urlBtn("🖼 Портфолио", t.portfolio_url)]);
+  rows.push([btn("⬅️ В меню", "m")]);
+  return { text: t.contacts_text, keyboard: rows };
+}
+async function screenPromo(env, appUrl) {
+  const t = await getTexts(env);
+  return {
+    text: "🔥 <b>Акция</b>\n\n" + t.promo_text,
+    keyboard: [[webBtn("✨ Записаться по акции", appUrl + "/app")], [btn("⬅️ В меню", "m")]],
+  };
+}
+async function screenMy(env, userId) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM bookings WHERE user_id=? AND status IN ('pending','confirmed') AND date>=? ORDER BY date, time`
+  ).bind(userId, todayStr(env)).all();
+  if (!results || !results.length)
+    return { text: "📅 <b>Мои записи</b>\n\nУ тебя пока нет активных записей 🤍", keyboard: [[btn("⬅️ В меню", "m")]] };
+  let text = "📅 <b>Мои записи</b>\n\n";
+  const rows = [];
+  for (const b of results) {
+    const st = b.status === "confirmed" ? "✅" : "⏳";
+    text += `${st} <b>${dateLabel(b.date)}</b> в ${b.time}\n   💅 ${html(b.service_name)} · ${b.price}₽\n\n`;
+    rows.push([btn(`❌ Отменить ${shortDate(b.date)} · ${b.time}`, `my:x:${b.id}`)]);
+  }
+  text += "<i>⏳ — ждёт подтверждения, ✅ — подтверждена</i>";
+  rows.push([btn("⬅️ В меню", "m")]);
+  return { text, keyboard: rows };
+}
+
+// ────────────────────────── ЭКРАНЫ: АДМИНКА ──────────────────────────
+async function screenAdmin(env) {
+  const today = todayStr(env);
+  const cnt = async (q, ...b) => (await env.DB.prepare(q).bind(...b).first()).n;
+  const todayN = await cnt("SELECT COUNT(*) n FROM bookings WHERE date=? AND status!='cancelled'", today);
+  const pendN = await cnt("SELECT COUNT(*) n FROM bookings WHERE status='pending' AND date>=?", today);
+  const freeN = await cnt("SELECT COUNT(*) n FROM slots WHERE status='free' AND date>=?", today);
+  return {
+    text:
+      "👑 <b>Админ-панель</b>\n\n" +
+      `📅 Записей сегодня: <b>${todayN}</b>\n` +
+      `⏳ Ждут подтверждения: <b>${pendN}</b>\n` +
+      `🟢 Свободных окошек: <b>${freeN}</b>`,
+    keyboard: [
+      [btn("📋 Записи", "a:bk"), btn("🗓 Окошки", "a:sl")],
+      [btn("💅 Услуги", "a:sv"), btn("✏️ Тексты", "a:tx")],
+      [btn("📣 Рассылка", "a:bc"), btn("📊 Статистика", "a:st")],
+      [btn("🏠 В меню бота", "m")],
+    ],
+  };
+}
+
+// — записи —
+async function screenAdminBookings(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM bookings WHERE status IN ('pending','confirmed') AND date>=? ORDER BY date, time LIMIT 30`
+  ).bind(todayStr(env)).all();
+  let text = "📋 <b>Записи</b>\n\n";
+  const rows = [];
+  if (!results || !results.length) text += "Пока пусто 🤍";
+  for (const b of results) {
+    const st = b.status === "confirmed" ? "✅" : "⏳";
+    rows.push([btn(`${st} ${shortDate(b.date)} ${b.time} · ${b.client_name} (${mention(b.client_username)})`, `a:bk:${b.id}`)]);
+  }
+  rows.push([btn("⬅️ Админка", "a")]);
+  return { text: text + "\n<i>Нажми на запись, чтобы открыть карточку</i>", keyboard: rows };
+}
+async function screenAdminBookingCard(env, id) {
+  const b = await env.DB.prepare("SELECT * FROM bookings WHERE id=?").bind(id).first();
+  if (!b) return screenAdminBookings(env);
+  const st = { pending: "⏳ Ждёт подтверждения", confirmed: "✅ Подтверждена", cancelled: "❌ Отменена" }[b.status];
+  const rows = [];
+  if (b.status === "pending") rows.push([btn("✅ Подтвердить", `a:ok:${b.id}`), btn("❌ Отклонить", `a:no:${b.id}`)]);
+  if (b.status === "confirmed") rows.push([btn("❌ Отменить запись", `a:no:${b.id}`)]);
+  if (b.client_username) rows.push([urlBtn("💬 Написать клиенту", `https://t.me/${b.client_username}`)]);
+  rows.push([btn("⬅️ К записям", "a:bk")]);
+  return {
+    text:
+      `📋 <b>Запись #${b.id}</b> · ${st}\n\n` +
+      `👤 Клиент: <b>${html(b.client_name)}</b> (${mention(b.client_username)})\n` +
+      (b.client_phone ? `📱 Телефон: <code>${html(b.client_phone)}</code>\n` : "") +
+      `💅 Услуга: ${html(b.service_name)} · ${b.price}₽\n` +
+      `🗓 Когда: <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n` +
+      `📲 Источник: ${b.source === "app" ? "Mini App" : "бот"}`,
+    keyboard: rows,
+  };
+}
+
+// — окошки —
+async function screenAdminSlots(env) {
+  const today = todayStr(env);
+  const { results } = await env.DB.prepare(
+    `SELECT s.*, b.client_name, b.client_username FROM slots s
+     LEFT JOIN bookings b ON b.id = s.booking_id
+     WHERE s.date>=? AND s.date<=? ORDER BY s.date, s.time`
+  ).bind(today, addDays(today, DAYS_AHEAD - 1)).all();
+  const rows = [
+    [btn("➕ Добавить окошко", "a:sl:add")],
+    [btn("🧨 Удалить ВСЕ окошки", "a:sl:clear")],
+  ];
+  let cur = null, text = "🗓 <b>Окошки</b>\n\n🟢 — свободно, 🔴 — занято\n\n";
+  if (!results || !results.length) text += "Окошек нет. Добавь первое! 👆";
+  for (const s of results || []) {
+    if (s.date !== cur) {
+      cur = s.date;
+      rows.push([btn(`— ${dateLabel(cur)} —`, "noop")]);
+    }
+    const label = s.status === "free" ? `🟢 ${s.time}` : `🔴 ${s.time}`;
+    rows.push([btn(label, `a:sl:v:${s.id}`)]);
+  }
+  rows.push([btn("⬅️ Админка", "a")]);
+  return { text, keyboard: rows };
+}
+function screenAdminSlotDatePick(env) {
+  const today = todayStr(env);
+  const rows = [];
+  for (let i = 0; i < DAYS_AHEAD; i += 2) {
+    const row = [];
+    for (let j = i; j < Math.min(i + 2, DAYS_AHEAD); j++) {
+      const d = addDays(today, j);
+      row.push(btn(dateLabel(d), `a:sl:d:${d}`));
+    }
+    rows.push(row);
+  }
+  rows.push([btn("⬅️ К окошкам", "a:sl")]);
+  return { text: "🗓 <b>Добавление окошка</b>\n\nВыбери дату:", keyboard: rows };
+}
+function screenAdminSlotTimePick(env, date) {
+  const rows = [];
+  for (let i = 0; i < TIME_PRESETS.length; i += 3) {
+    rows.push(TIME_PRESETS.slice(i, i + 3).map((t) => btn(`🕐 ${t}`, `a:sl:t:${date}:${t}`)));
+  }
+  rows.push([btn("✍️ Своё время", `a:sl:tm:${date}`)]);
+  rows.push([btn("⬅️ К датам", "a:sl:add"), btn("🗓 К окошкам", "a:sl")]);
+  return {
+    text: `🗓 <b>Добавление окошка</b>\n\nДата: <b>${dateLabel(date)}</b>\n\nВыбери время (можно добавить несколько подряд):`,
+    keyboard: rows,
+  };
+}
+async function screenAdminSlotCard(env, id) {
+  const s = await env.DB.prepare(
+    `SELECT s.*, b.client_name, b.client_username, b.client_phone, b.service_name, b.id AS bid, b.status AS bstatus
+     FROM slots s LEFT JOIN bookings b ON b.id = s.booking_id WHERE s.id=?`
+  ).bind(id).first();
+  if (!s) return screenAdminSlots(env);
+  const rows = [];
+  let text;
+  if (s.status === "free") {
+    text = `🟢 <b>Свободное окошко</b>\n\n🗓 ${dateLabel(s.date)} в ${s.time}`;
+    rows.push([btn("🗑 Удалить это окошко", `a:sl:x:${s.id}`)]);
+  } else {
+    text =
+      `🔴 <b>Окошко занято</b>\n\n🗓 ${dateLabel(s.date)} в ${s.time}\n\n` +
+      `👤 ${html(s.client_name || "")} (${mention(s.client_username)})\n` +
+      (s.client_phone ? `📱 <code>${html(s.client_phone)}</code>\n` : "") +
+      `💅 ${html(s.service_name || "")}`;
+    if (s.bid) rows.push([btn("📋 Открыть запись", `a:bk:${s.bid}`)]);
+  }
+  rows.push([btn("⬅️ К окошкам", "a:sl")]);
+  return { text, keyboard: rows };
+}
+
+// — услуги —
+async function screenAdminServices(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM services ORDER BY sort, id").all();
+  let text = "💅 <b>Услуги (редактирование)</b>\n\n";
+  const rows = [[btn("➕ Добавить услугу", "a:sv:add")]];
+  for (const s of results || []) {
+    const on = s.active ? "" : " 💤";
+    rows.push([btn(`${s.name} · ${s.price}₽${on}`, `a:sv:${s.id}`)]);
+  }
+  if (!results || !results.length) text += "Пусто. Добавь первую услугу 👆";
+  else text += "<i>💤 — скрыта от клиентов</i>";
+  rows.push([btn("⬅️ Админка", "a")]);
+  return { text, keyboard: rows };
+}
+async function screenAdminServiceCard(env, id) {
+  const s = await env.DB.prepare("SELECT * FROM services WHERE id=?").bind(id).first();
+  if (!s) return screenAdminServices(env);
+  return {
+    text:
+      `💅 <b>${html(s.name)}</b> ${s.active ? "" : "💤 <i>(скрыта)</i>"}\n\n` +
+      (s.description ? `<blockquote>${html(s.description)}</blockquote>\n` : "") +
+      `💰 Цена: <b>${s.price}₽</b>\n⏱ Длительность: <b>${s.duration_min} мин</b>`,
+    keyboard: [
+      [btn("✏️ Название", `a:sv:e:name:${s.id}`), btn("💰 Цена", `a:sv:e:price:${s.id}`)],
+      [btn("⏱ Длительность", `a:sv:e:dur:${s.id}`), btn("📝 Описание", `a:sv:e:desc:${s.id}`)],
+      [btn(s.active ? "💤 Скрыть" : "✨ Показать", `a:sv:tg:${s.id}`), btn("🗑 Удалить", `a:sv:del:${s.id}`)],
+      [btn("⬅️ К услугам", "a:sv")],
+    ],
+  };
+}
+
+// — тексты —
+function screenAdminTexts() {
+  const keys = [
+    ["start_text", "💬 Приветствие (/start)"],
+    ["about_text", "🤍 О мастере"],
+    ["contacts_text", "📍 Контакты"],
+    ["promo_text", "🔥 Акция (пусто = скрыта)"],
+    ["portfolio_url", "🖼 Ссылка на портфолио"],
+    ["master_link", "💬 Ссылка «Написать мастеру»"],
+  ];
+  const rows = keys.map(([k, label]) => [btn(label, `a:tx:${k}`)]);
+  rows.push([btn("⬅️ Админка", "a")]);
+  return { text: "✏️ <b>Тексты бота</b>\n\nВыбери, что изменить:", keyboard: rows };
+}
+
+// — статистика —
+async function screenAdminStats(env) {
+  const today = todayStr(env);
+  const one = async (q, ...b) => (await env.DB.prepare(q).bind(...b).first()).n;
+  const users = await one("SELECT COUNT(*) n FROM users");
+  const total = await one("SELECT COUNT(*) n FROM bookings WHERE status!='cancelled'");
+  const upcoming = await one("SELECT COUNT(*) n FROM bookings WHERE status IN ('pending','confirmed') AND date>=?", today);
+  const revenue = await one("SELECT COALESCE(SUM(price),0) n FROM bookings WHERE status='confirmed' AND date>=?", today);
+  return {
+    text:
+      "📊 <b>Статистика</b>\n\n" +
+      `👥 Клиентов в боте: <b>${users}</b>\n` +
+      `📋 Всего записей: <b>${total}</b>\n` +
+      `🗓 Предстоящих: <b>${upcoming}</b>\n` +
+      `💰 Ожидаемая выручка: <b>${revenue}₽</b>`,
+    keyboard: [[btn("⬅️ Админка", "a")]],
+  };
+}
+
+// ────────────────────────── УВЕДОМЛЕНИЯ ──────────────────────────
+async function notifyAdminNewBooking(env, b) {
+  const ids = (env.ADMIN_ID || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const text =
+    "🔔 <b>Новая запись!</b>\n\n" +
+    `👤 Клиент: <b>${html(b.client_name)}</b> (${mention(b.client_username)})\n` +
+    (b.client_phone ? `📱 Телефон: <code>${html(b.client_phone)}</code>\n` : "") +
+    `💅 Услуга: ${html(b.service_name)} · ${b.price}₽\n` +
+    `🗓 Когда: <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n` +
+    `📲 Источник: ${b.source === "app" ? "Mini App" : "бот"}`;
+  for (const id of ids) {
+    await send(env, id, text, {
+      reply_markup: kb([[btn("✅ Подтвердить", `a:ok:${b.id}`), btn("❌ Отклонить", `a:no:${b.id}`)]]),
+    });
+  }
+}
+
+// ────────────────────────── ОБРАБОТКА СООБЩЕНИЙ ──────────────────────────
+async function onMessage(env, msg, appUrl) {
+  const chatId = msg.chat.id;
+  const from = msg.from;
+  if (!from) return;
+  await upsertUser(env, from);
+  const user = await getUser(env, from.id);
+  const text = (msg.text || "").trim();
+
+  if (text.startsWith("/start")) {
+    await setState(env, from.id, "idle");
+    await send(env, chatId, "💅", {});
+    await show(env, { chatId }, await screenMain(env, from.first_name || "красотка", appUrl));
+    return;
+  }
+  if (text.startsWith("/admin")) {
+    if (!isAdmin(env, from.id)) return send(env, chatId, "Эта команда только для мастера 🙈");
+    await setState(env, from.id, "idle");
+    await show(env, { chatId }, await screenAdmin(env));
+    return;
+  }
+  if (text.startsWith("/cancel")) {
+    await setState(env, from.id, "idle");
+    await show(env, { chatId }, await screenMain(env, from.first_name || "красотка", appUrl));
+    return;
+  }
+
+  const st = user.state || "idle";
+  const p = JSON.parse(user.payload || "{}");
+
+  // ── админские состояния ──
+  if (isAdmin(env, from.id)) {
+    // добавление услуги
+    if (st === "adm_svc_name") {
+      await setState(env, from.id, "adm_svc_price", { ...p, name: text });
+      return send(env, chatId, "💰 Введи цену в рублях (просто число, например <code>1800</code>):");
+    }
+    if (st === "adm_svc_price") {
+      const price = parseInt(text.replace(/\D/g, ""), 10);
+      if (!price) return send(env, chatId, "🙈 Нужно число. Попробуй ещё раз, например <code>1800</code>:");
+      await setState(env, from.id, "adm_svc_dur", { ...p, price });
+      return send(env, chatId, "⏱ Длительность в минутах (например <code>120</code>):");
+    }
+    if (st === "adm_svc_dur") {
+      const dur = parseInt(text.replace(/\D/g, ""), 10);
+      if (!dur) return send(env, chatId, "🙈 Нужно число минут. Попробуй ещё раз:");
+      await setState(env, from.id, "adm_svc_desc", { ...p, dur });
+      return send(env, chatId, "📝 Короткое описание услуги (или <code>-</code>, чтобы пропустить):");
+    }
+    if (st === "adm_svc_desc") {
+      const desc = text === "-" ? "" : text;
+      const r = await env.DB.prepare("INSERT INTO services (name, description, price, duration_min) VALUES (?,?,?,?)")
+        .bind(p.name, desc, p.price, p.dur).run();
+      await setState(env, from.id, "idle");
+      await send(env, chatId, "✅ Услуга добавлена!");
+      await show(env, { chatId }, await screenAdminServiceCard(env, r.meta.last_row_id));
+      return;
+    }
+    // редактирование услуги
+    if (st === "adm_svc_edit") {
+      const fields = { name: "name", price: "price", dur: "duration_min", desc: "description" };
+      const col = fields[p.field];
+      let val = text;
+      if (p.field === "price" || p.field === "dur") {
+        val = parseInt(text.replace(/\D/g, ""), 10);
+        if (!val) return send(env, chatId, "🙈 Нужно число. Попробуй ещё раз:");
+      }
+      if (p.field === "desc" && text === "-") val = "";
+      await env.DB.prepare(`UPDATE services SET ${col}=? WHERE id=?`).bind(val, p.id).run();
+      await setState(env, from.id, "idle");
+      await send(env, chatId, "✅ Обновлено!");
+      await show(env, { chatId }, await screenAdminServiceCard(env, p.id));
+      return;
+    }
+    // своё время окошка
+    if (st === "adm_slot_time") {
+      const m = text.match(/^([01]?\d|2[0-3])[:.]([0-5]\d)$/);
+      if (!m) return send(env, chatId, "🙈 Формат времени: <code>ЧЧ:ММ</code>, например <code>14:30</code>");
+      const time = `${pad2(m[1])}:${m[2]}`;
+      await env.DB.prepare("INSERT OR IGNORE INTO slots (date, time) VALUES (?,?)").bind(p.date, time).run();
+      await setState(env, from.id, "idle");
+      await send(env, chatId, `✅ Окошко ${dateLabel(p.date)} в ${time} добавлено!`);
+      await show(env, { chatId }, screenAdminSlotTimePick(env, p.date));
+      return;
+    }
+    // редактирование текстов
+    if (st === "adm_text") {
+      await env.DB.prepare("INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        .bind(p.key, text === "-" ? "" : text).run();
+      await setState(env, from.id, "idle");
+      await send(env, chatId, "✅ Текст обновлён!");
+      await show(env, { chatId }, screenAdminTexts());
+      return;
+    }
+    // рассылка
+    if (st === "adm_bc") {
+      const photo = msg.photo && msg.photo.length ? msg.photo[msg.photo.length - 1].file_id : null;
+      const body = photo ? (msg.caption || "") : text;
+      if (!body && !photo) return send(env, chatId, "🙈 Пришли текст или фото с подписью для рассылки");
+      await setState(env, from.id, "adm_bc_confirm", { text: body, photo });
+      return send(env, chatId,
+        "📣 <b>Предпросмотр рассылки</b>\n\n" + (photo ? "<i>(фото с подписью)</i>\n" : "") + html(body).slice(0, 500) +
+        "\n\nОтправить всем клиентам?", {
+          reply_markup: kb([[btn("🚀 Отправить", "a:bc:y")], [btn("❌ Отмена", "a:bc:n")]]),
+        });
+    }
+  }
+
+  // дефолт — главное меню
+  await show(env, { chatId }, await screenMain(env, from.first_name || "красотка", appUrl));
+}
+
+// ────────────────────────── ОБРАБОТКА КНОПОК ──────────────────────────
+async function onCallback(env, cb, appUrl) {
+  const from = cb.from;
+  const chatId = cb.message.chat.id;
+  const messageId = cb.message.message_id;
+  const c = { chatId, messageId };
+  const data = cb.data || "";
+  await upsertUser(env, from);
+  const parts = data.split(":");
+  const cmd = parts[0];
+
+  const adm = isAdmin(env, from.id);
+  // защита админских колбэков
+  if (cmd === "a" && !adm) {
+    await answer(env, cb.id, "Только для мастера 🙈", true);
+    return;
+  }
+
+  // ── клиентские ──
+  if (cmd === "noop") return answer(env, cb.id);
+  if (cmd === "m") {
+    await answer(env, cb.id);
+    await setState(env, from.id, "idle");
+    return show(env, c, await screenMain(env, from.first_name || "красотка", appUrl));
+  }
+  if (cmd === "sv" && parts.length === 1) { await answer(env, cb.id); return show(env, c, await screenServices(env)); }
+  if (cmd === "sv") { await answer(env, cb.id); return show(env, c, await screenService(env, +parts[1], appUrl)); }
+  if (cmd === "ab") { await answer(env, cb.id); return show(env, c, await screenAbout(env, appUrl)); }
+  if (cmd === "ct") { await answer(env, cb.id); return show(env, c, await screenContacts(env)); }
+  if (cmd === "promo") { await answer(env, cb.id); return show(env, c, await screenPromo(env, appUrl)); }
+  if (cmd === "my" && parts.length === 1) { await answer(env, cb.id); return show(env, c, await screenMy(env, from.id)); }
+  if (cmd === "my" && parts[1] === "x") {
+    const b = await cancelBooking(env, +parts[2], false);
+    if (b) {
+      await answer(env, cb.id, "Запись отменена");
+      const ids = (env.ADMIN_ID || "").split(",").map((s) => s.trim()).filter(Boolean);
+      for (const id of ids)
+        await send(env, id, `⚠️ <b>Клиент отменил запись</b>\n\n👤 ${html(b.client_name)} (${mention(b.client_username)})\n🗓 ${dateLabel(b.date)} в ${b.time}\n💅 ${html(b.service_name)}`);
+    } else await answer(env, cb.id, "Уже отменена", true);
+    return show(env, c, await screenMy(env, from.id));
+  }
+
+  // ── админка ──
+  if (data === "a") { await answer(env, cb.id); return show(env, c, await screenAdmin(env)); }
+  if (data === "a:bk") { await answer(env, cb.id); return show(env, c, await screenAdminBookings(env)); }
+  if (cmd === "a" && parts[1] === "bk") { await answer(env, cb.id); return show(env, c, await screenAdminBookingCard(env, +parts[2])); }
+  if (cmd === "a" && (parts[1] === "ok" || parts[1] === "no")) {
+    const id = +parts[2];
+    const b = await env.DB.prepare("SELECT * FROM bookings WHERE id=?").bind(id).first();
+    if (!b) { await answer(env, cb.id, "Запись не найдена", true); return show(env, c, await screenAdminBookings(env)); }
+    if (parts[1] === "ok") {
+      await env.DB.prepare("UPDATE bookings SET status='confirmed' WHERE id=?").bind(id).run();
+      await answer(env, cb.id, "✅ Подтверждено");
+      await send(env, b.user_id,
+        `✅ <b>Запись подтверждена!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\nЖду тебя, красотка 🤍\n<i>Адрес отправлю отдельным сообщением 💌</i>`,
+        { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))]]) });
+    } else {
+      await cancelBooking(env, id, true);
+      await answer(env, cb.id, "❌ Запись отменена, окошко освобождено");
+      await send(env, b.user_id,
+        `😔 <b>Запись отменена</b>\n\n🗓 ${dateLabel(b.date)} в ${b.time}\n💅 ${html(b.service_name)}\n\nЕсли это ошибка — напиши мне или запишись заново 🤍`);
+    }
+    return show(env, c, await screenAdminBookingCard(env, id));
+  }
+  // окошки
+  if (data === "a:sl") { await answer(env, cb.id); return show(env, c, await screenAdminSlots(env)); }
+  if (data === "a:sl:add") { await answer(env, cb.id); return show(env, c, screenAdminSlotDatePick(env)); }
+  if (parts[1] === "sl" && parts[2] === "d") { await answer(env, cb.id); return show(env, c, screenAdminSlotTimePick(env, parts[3])); }
+  if (parts[1] === "sl" && parts[2] === "t") {
+    const date = parts[3];
+    const time = parts.slice(4).join(":"); // время содержит «:», склеиваем обратно
+    await env.DB.prepare("INSERT OR IGNORE INTO slots (date, time) VALUES (?,?)").bind(date, time).run();
+    await answer(env, cb.id, `✅ Добавлено: ${time}`);
+    return show(env, c, screenAdminSlotTimePick(env, date));
+  }
+  if (parts[1] === "sl" && parts[2] === "tm") {
+    await setState(env, from.id, "adm_slot_time", { date: parts[3] });
+    await answer(env, cb.id);
+    await show(env, c, { text: `✍️ Введи время для <b>${dateLabel(parts[3])}</b> в формате <code>ЧЧ:ММ</code>\n\nНапример: <code>14:30</code>`, keyboard: [[btn("⬅️ Отмена", "a:sl")]] });
+    return;
+  }
+  if (parts[1] === "sl" && parts[2] === "v") { await answer(env, cb.id); return show(env, c, await screenAdminSlotCard(env, +parts[3])); }
+  if (parts[1] === "sl" && parts[2] === "x") {
+    const s = await env.DB.prepare("SELECT * FROM slots WHERE id=?").bind(+parts[3]).first();
+    if (s && s.status === "free") {
+      await env.DB.prepare("DELETE FROM slots WHERE id=?").bind(+parts[3]).run();
+      await answer(env, cb.id, `🗑 Окошко ${shortDate(s.date)} ${s.time} удалено`);
+    } else await answer(env, cb.id, "Нельзя удалить занятое окошко", true);
+    return show(env, c, await screenAdminSlots(env));
+  }
+  if (data === "a:sl:clear") {
+    await answer(env, cb.id);
+    return show(env, c, {
+      text: "🧨 <b>Удалить ВСЕ свободные окошки?</b>\n\n<i>Занятые окошки (с записями) не пострадают.</i>",
+      keyboard: [[btn("🧨 Да, удалить все", "a:sl:clear:y")], [btn("⬅️ Отмена", "a:sl")]],
+    });
+  }
+  if (data === "a:sl:clear:y") {
+    const r = await env.DB.prepare("DELETE FROM slots WHERE status='free' AND date>=?").bind(todayStr(env)).run();
+    await answer(env, cb.id, `🧨 Удалено окошек: ${r.meta.changes}`, true);
+    return show(env, c, await screenAdminSlots(env));
+  }
+  // услуги
+  if (data === "a:sv") { await answer(env, cb.id); return show(env, c, await screenAdminServices(env)); }
+  if (data === "a:sv:add") {
+    await setState(env, from.id, "adm_svc_name", {});
+    await answer(env, cb.id);
+    return send(env, chatId, "💅 <b>Новая услуга</b>\n\nВведи название (например <code>Маникюр + гель-лак</code>):");
+  }
+  if (parts[1] === "sv" && parts[2] === "e") {
+    const [, , , field, id] = parts;
+    const prompts = {
+      name: "✏️ Введи новое название услуги:",
+      price: "💰 Введи новую цену (число):",
+      dur: "⏱ Введи новую длительность в минутах:",
+      desc: "📝 Введи новое описание (или <code>-</code> чтобы убрать):",
+    };
+    await setState(env, from.id, "adm_svc_edit", { field, id: +id });
+    await answer(env, cb.id);
+    return send(env, chatId, prompts[field] + "\n\n<i>/cancel — отмена</i>");
+  }
+  if (parts[1] === "sv" && parts[2] === "tg") {
+    await env.DB.prepare("UPDATE services SET active = 1 - active WHERE id=?").bind(+parts[3]).run();
+    await answer(env, cb.id, "Готово ✨");
+    return show(env, c, await screenAdminServiceCard(env, +parts[3]));
+  }
+  if (parts[1] === "sv" && parts[2] === "del" && parts.length === 4) {
+    await answer(env, cb.id);
+    return show(env, c, {
+      text: "🗑 <b>Удалить услугу?</b>\n\n<i>Старые записи останутся в истории.</i>",
+      keyboard: [[btn("🗑 Да, удалить", `a:sv:del:y:${parts[3]}`)], [btn("⬅️ Назад", `a:sv:${parts[3]}`)]],
+    });
+  }
+  if (parts[1] === "sv" && parts[2] === "del" && parts[3] === "y") {
+    await env.DB.prepare("DELETE FROM services WHERE id=?").bind(+parts[4]).run();
+    await answer(env, cb.id, "🗑 Услуга удалена");
+    return show(env, c, await screenAdminServices(env));
+  }
+  if (parts[1] === "sv") { await answer(env, cb.id); return show(env, c, await screenAdminServiceCard(env, +parts[2])); }
+  // тексты
+  if (data === "a:tx") { await answer(env, cb.id); return show(env, c, screenAdminTexts()); }
+  if (parts[1] === "tx") {
+    const key = parts[2];
+    const cur = await getSetting(env, key);
+    await setState(env, from.id, "adm_text", { key });
+    await answer(env, cb.id);
+    return send(env, chatId,
+      `✏️ <b>Редактирование</b>\n\nТекущее значение:\n<blockquote>${html(cur) || "<i>пусто</i>"}</blockquote>\nОтправь новый текст (поддерживается HTML: &lt;b&gt;, &lt;i&gt;).\n<code>-</code> — очистить.\n<i>/cancel — отмена</i>`);
+  }
+  // рассылка
+  if (data === "a:bc") {
+    await setState(env, from.id, "adm_bc", {});
+    await answer(env, cb.id);
+    return send(env, chatId,
+      "📣 <b>Рассылка</b>\n\nОтправь сообщение для всех клиентов: текст (можно с HTML-разметкой) или фото с подписью 📸\n\n<i>/cancel — отмена</i>");
+  }
+  if (data === "a:bc:n") {
+    await setState(env, from.id, "idle");
+    await answer(env, cb.id, "Рассылка отменена");
+    return show(env, c, await screenAdmin(env));
+  }
+  if (data === "a:bc:y") {
+    const user = await getUser(env, from.id);
+    const p = JSON.parse(user.payload || "{}");
+    await setState(env, from.id, "idle");
+    await answer(env, cb.id, "🚀 Рассылаю...");
+    const { results } = await env.DB.prepare("SELECT telegram_id FROM users WHERE blocked=0").all();
+    let ok = 0, fail = 0;
+    for (const u of results || []) {
+      const r = p.photo
+        ? await tg(env, "sendPhoto", { chat_id: u.telegram_id, photo: p.photo, caption: p.text, parse_mode: "HTML" })
+        : await tg(env, "sendMessage", { chat_id: u.telegram_id, text: p.text, parse_mode: "HTML" });
+      if (r.ok) ok++;
+      else {
+        fail++;
+        if (r.error_code === 403) await env.DB.prepare("UPDATE users SET blocked=1 WHERE telegram_id=?").bind(u.telegram_id).run();
+      }
+    }
+    await send(env, chatId, `📣 <b>Рассылка завершена</b>\n\n✅ Доставлено: ${ok}\n❌ Не доставлено: ${fail}`);
+    return show(env, c, await screenAdmin(env));
+  }
+  // статистика
+  if (data === "a:st") { await answer(env, cb.id); return show(env, c, await screenAdminStats(env)); }
+
+  await answer(env, cb.id);
+}
+
+// ────────────────────────── MINI APP: API ──────────────────────────
+async function validateInitData(initData, token) {
+  try {
+    const params = new URLSearchParams(initData);
+    const hash = params.get("hash");
+    if (!hash) return null;
+    params.delete("hash");
+    const dataCheck = [...params.entries()].map(([k, v]) => `${k}=${v}`).sort().join("\n");
+    const enc = new TextEncoder();
+    const k1 = await crypto.subtle.importKey("raw", enc.encode("WebAppData"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const secret = await crypto.subtle.sign("HMAC", k1, enc.encode(token));
+    const k2 = await crypto.subtle.importKey("raw", secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const sig = await crypto.subtle.sign("HMAC", k2, enc.encode(dataCheck));
+    const hex = [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    if (hex !== hash) return null;
+    const user = JSON.parse(params.get("user") || "null");
+    const authDate = parseInt(params.get("auth_date") || "0", 10);
+    if (Date.now() / 1000 - authDate > 86400 * 7) return null; // старше 7 дней — нельзя
+    return user;
+  } catch {
+    return null;
+  }
+}
+const json = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json; charset=utf-8" } });
+
+async function apiData(env, user) {
+  await upsertUser(env, user);
+  const u = await getUser(env, user.id);
+  const services = (await env.DB.prepare("SELECT id, name, description, price, duration_min FROM services WHERE active=1 ORDER BY sort, id").all()).results || [];
+  const slots = {};
+  for (const s of await freeSlots(env)) {
+    (slots[s.date] = slots[s.date] || []).push({ id: s.id, time: s.time });
+  }
+  const bookings = (await env.DB.prepare(
+    "SELECT id, service_name, price, date, time, status FROM bookings WHERE user_id=? AND status IN ('pending','confirmed') AND date>=? ORDER BY date, time"
+  ).bind(user.id, todayStr(env)).all()).results || [];
+  const texts = await getTexts(env);
+  return json({
+    ok: true,
+    user: { id: user.id, first_name: user.first_name, username: user.username, phone: (u && u.phone) || "" },
+    services, slots, bookings,
+    texts: { about: texts.about_text, contacts: texts.contacts_text, promo: texts.promo_text, portfolio_url: texts.portfolio_url, master_link: texts.master_link },
+  });
+}
+
+async function apiBook(env, user, body) {
+  const { slot_id, service_id, name, phone } = body || {};
+  if (!slot_id || !service_id || !name || String(name).trim().length < 2)
+    return json({ ok: false, error: "Заполни имя и выбери время 🙈" }, 400);
+  if (phone && !/^[+]?[\d\s\-()]{10,18}$/.test(String(phone).trim()))
+    return json({ ok: false, error: "Похоже, в телефоне опечатка 🙈" }, 400);
+  const res = await createBooking(env, {
+    userId: user.id, slotId: +slot_id, serviceId: +service_id,
+    name: String(name).trim().slice(0, 40), phone: phone ? String(phone).trim() : "", source: "app",
+  });
+  if (!res.ok) return json({ ok: false, error: res.error === "slot_taken" ? "Упс, это окошко уже заняли 😔 Выбери другое!" : "Что-то пошло не так" }, 409);
+  const b = res.booking;
+  await notifyAdminNewBooking(env, b);
+  await send(env, user.id,
+    `🎉 <b>Ты записана!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\n⏳ Я подтвержу запись в ближайшее время и отправлю адрес 💌`,
+    { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))]]) });
+  return json({ ok: true, booking: { id: b.id, date: b.date, time: b.time, service_name: b.service_name, price: b.price, date_label: dateLabel(b.date) } });
+}
+
+async function apiCancel(env, user, body) {
+  const b = await env.DB.prepare("SELECT * FROM bookings WHERE id=?").bind(+(body || {}).id).first();
+  if (!b || b.user_id !== user.id) return json({ ok: false, error: "Запись не найдена" }, 404);
+  await cancelBooking(env, b.id, false);
+  const ids = (env.ADMIN_ID || "").split(",").map((s) => s.trim()).filter(Boolean);
+  for (const id of ids)
+    await send(env, id, `⚠️ <b>Клиент отменил запись</b>\n\n👤 ${html(b.client_name)} (${mention(b.client_username)})\n🗓 ${dateLabel(b.date)} в ${b.time}\n💅 ${html(b.service_name)}`);
+  return json({ ok: true });
+}
+
+// ────────────────────────── MINI APP: HTML ──────────────────────────
+// Внимание: внутри НЕ использовать символы ` и ${ — файл вставлен как String.raw
+const MINI_APP_HTML = String.raw`<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>DARWN.NAILL · Запись</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #14090f;
+    --card: rgba(255,255,255,.055);
+    --card-border: rgba(255,255,255,.09);
+    --text: #f5e9e2;
+    --muted: #b89fae;
+    --accent1: #f2b8c6;
+    --accent2: #d99a6c;
+    --grad: linear-gradient(135deg, #f2b8c6, #d99a6c);
+    --red: #ff8fa3;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, 'Segoe UI', Roboto, 'Inter', sans-serif;
+    overflow-x: hidden; min-height:100vh;
+  }
+  .blob { position:fixed; border-radius:50%; filter:blur(70px); opacity:.5; pointer-events:none; z-index:0; }
+  .b1 { width:280px; height:280px; background:#7a3b52; top:-90px; right:-80px; animation:fl 9s ease-in-out infinite alternate; }
+  .b2 { width:240px; height:240px; background:#5c3a1e; bottom:-70px; left:-70px; animation:fl 11s ease-in-out infinite alternate-reverse; }
+  @keyframes fl { to { transform: translateY(30px) scale(1.12); } }
+  .wrap { position:relative; z-index:1; max-width:480px; margin:0 auto; padding:22px 16px 90px; }
+  .fade { animation:fade .35s ease; }
+  @keyframes fade { from { opacity:0; transform:translateY(10px);} to { opacity:1; transform:none;} }
+
+  .logo { text-align:center; padding:18px 0 6px; }
+  .logo .ring {
+    width:86px; height:86px; margin:0 auto 12px; border-radius:50%;
+    background:var(--grad); display:flex; align-items:center; justify-content:center;
+    font-size:40px; box-shadow:0 8px 32px rgba(217,154,108,.4);
+  }
+  .logo h1 { font-size:26px; letter-spacing:5px; font-weight:800; background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .logo p { color:var(--muted); font-size:13px; margin-top:6px; letter-spacing:.4px; }
+
+  .card {
+    background:var(--card); border:1px solid var(--card-border); border-radius:20px;
+    padding:16px; margin-top:14px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  .promo { border:1px solid rgba(242,184,198,.35); background:linear-gradient(135deg, rgba(242,184,198,.12), rgba(217,154,108,.08)); }
+  .promo .tag { font-size:11px; font-weight:700; letter-spacing:2px; color:var(--accent1); }
+  .promo .txt { margin-top:6px; font-size:14px; line-height:1.5; }
+
+  .tabs { display:flex; gap:8px; margin-top:20px; }
+  .tab {
+    flex:1; text-align:center; padding:11px 0; border-radius:14px; font-size:14px; font-weight:600;
+    background:var(--card); border:1px solid var(--card-border); color:var(--muted); cursor:pointer; transition:.2s;
+  }
+  .tab.active { background:var(--grad); color:#2a1410; border-color:transparent; box-shadow:0 6px 20px rgba(217,154,108,.35); }
+
+  .svc { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:15px 16px; margin-top:12px; cursor:pointer; transition:transform .15s; }
+  .svc:active { transform:scale(.98); }
+  .svc .nm { font-weight:700; font-size:15px; }
+  .svc .ds { color:var(--muted); font-size:12.5px; margin-top:4px; line-height:1.45; }
+  .svc .dur { color:var(--muted); font-size:11.5px; margin-top:5px; }
+  .svc .pr { text-align:right; flex-shrink:0; }
+  .svc .pr b { font-size:17px; background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .svc .go { display:inline-block; margin-top:6px; font-size:11px; color:var(--accent1); border:1px solid rgba(242,184,198,.4); padding:4px 10px; border-radius:20px; }
+
+  .sect { font-size:12px; font-weight:700; letter-spacing:1.6px; color:var(--muted); text-transform:uppercase; margin:22px 2px 4px; }
+  .dates { display:flex; gap:8px; overflow-x:auto; padding:8px 2px 12px; scrollbar-width:none; }
+  .dates::-webkit-scrollbar { display:none; }
+  .dchip {
+    flex:0 0 auto; width:62px; padding:10px 0; text-align:center; border-radius:16px; cursor:pointer;
+    background:var(--card); border:1px solid var(--card-border); transition:.2s;
+  }
+  .dchip .wd { font-size:11px; color:var(--muted); }
+  .dchip .dd { font-size:17px; font-weight:800; margin-top:2px; }
+  .dchip.active { background:var(--grad); color:#2a1410; border-color:transparent; box-shadow:0 6px 18px rgba(217,154,108,.4); }
+  .dchip.active .wd { color:#5c3a2e; }
+  .times { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; padding:8px 2px; }
+  .tchip { padding:11px 0; text-align:center; border-radius:13px; font-size:14px; font-weight:600; cursor:pointer; background:var(--card); border:1px solid var(--card-border); transition:.15s; }
+  .tchip.active { background:var(--grad); color:#2a1410; border-color:transparent; box-shadow:0 5px 16px rgba(217,154,108,.4); }
+  .empty { text-align:center; color:var(--muted); font-size:14px; padding:26px 10px; }
+
+  .inp {
+    width:100%; padding:14px 16px; border-radius:14px; border:1px solid var(--card-border);
+    background:rgba(255,255,255,.05); color:var(--text); font-size:15px; margin-top:10px; outline:none;
+  }
+  .inp:focus { border-color:var(--accent1); }
+  .inp::placeholder { color:#7d6572; }
+
+  .cta {
+    position:fixed; left:0; right:0; bottom:0; padding:14px 16px calc(14px + env(safe-area-inset-bottom));
+    background:linear-gradient(to top, #14090f 60%, transparent); z-index:5;
+  }
+  .cta button {
+    width:100%; max-width:448px; margin:0 auto; display:block; padding:16px; border:none; border-radius:17px;
+    background:var(--grad); color:#2a1410; font-size:16px; font-weight:800; letter-spacing:.3px; cursor:pointer;
+    box-shadow:0 10px 30px rgba(217,154,108,.45); transition:transform .15s;
+  }
+  .cta button:active { transform:scale(.97); }
+  .cta button:disabled { opacity:.45; box-shadow:none; }
+
+  .bk { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .bk .st { font-size:11px; font-weight:700; padding:4px 10px; border-radius:20px; }
+  .st.p { background:rgba(242,184,198,.15); color:var(--accent1); border:1px solid rgba(242,184,198,.35); }
+  .st.c { background:rgba(151,224,173,.12); color:#97e0ad; border:1px solid rgba(151,224,173,.3); }
+  .bk .cancel { font-size:12px; color:var(--red); background:none; border:1px solid rgba(255,143,163,.35); border-radius:20px; padding:6px 12px; cursor:pointer; margin-top:8px; }
+
+  .linkbtn { display:block; text-align:center; padding:14px; border-radius:15px; background:var(--card); border:1px solid var(--card-border); color:var(--text); text-decoration:none; font-weight:600; font-size:14.5px; margin-top:10px; }
+  .back { color:var(--muted); font-size:14px; cursor:pointer; padding:6px 0; display:inline-block; }
+  .ok-screen { text-align:center; padding-top:60px; }
+  .ok-screen .chk { width:92px; height:92px; margin:0 auto 18px; border-radius:50%; background:var(--grad); display:flex; align-items:center; justify-content:center; font-size:44px; box-shadow:0 12px 40px rgba(217,154,108,.5); animation:pop .5s cubic-bezier(.2,1.6,.4,1); }
+  @keyframes pop { from { transform:scale(0);} }
+  .skel { height:74px; border-radius:20px; margin-top:12px; background:linear-gradient(90deg, rgba(255,255,255,.04), rgba(255,255,255,.09), rgba(255,255,255,.04)); background-size:200% 100%; animation:sk 1.2s infinite; }
+  @keyframes sk { to { background-position:-200% 0; } }
+  .err { text-align:center; padding:60px 20px; color:var(--muted); }
+  .toast {
+    position:fixed; top:14px; left:50%; transform:translateX(-50%); background:#2a1a22; border:1px solid var(--card-border);
+    color:var(--text); padding:11px 18px; border-radius:14px; font-size:13.5px; z-index:50; box-shadow:0 10px 30px rgba(0,0,0,.5); animation:fade .25s;
+  }
+</style>
+</head>
+<body>
+<div class="blob b1"></div><div class="blob b2"></div>
+<div class="wrap" id="app">
+  <div class="skel"></div><div class="skel"></div><div class="skel"></div>
+</div>
+<div id="cta"></div>
+
+<script>
+var tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+if (tg) { tg.ready(); tg.expand(); try { tg.setHeaderColor('#14090f'); tg.setBackgroundColor('#14090f'); } catch(e){} }
+var D = null;          // данные с сервера
+var view = 'home';     // home | book | done | my | contacts
+var sel = { svc:null, date:null, slotId:null, time:null };
+var form = { name:'', phone:'' };
+var sending = false;
+
+function h(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function $(id){ return document.getElementById(id); }
+function el(id){ return $(id); }
+function toast(t){ var d=document.createElement('div'); d.className='toast'; d.textContent=t; document.body.appendChild(d); setTimeout(function(){ d.remove(); }, 2600); }
+function haptic(style){ try { if(tg && tg.HapticFeedback) tg.HapticFeedback.impactOccurred(style||'light'); } catch(e){} }
+function nl2br(s){ return h(s).replace(/\n/g,'<br>').replace(/<\/?(b|i|u|s|code|blockquote)>/g, function(m){ return m; }); }
+function stripTags(s){ return String(s||'').replace(/<[^>]*>/g,''); }
+function fmtDateLabel(ds){
+  var wd=['Вс','Пн','Вт','Ср','Чт','Пт','Сб'];
+  var mo=['янв','фев','мар','апр','мая','июн','июл','авг','сен','окт','ноя','дек'];
+  var p=ds.split('-'); var dt=new Date(Date.UTC(+p[0], +p[1]-1, +p[2]));
+  return { wd: wd[dt.getUTCDay()], dd: String(+p[2]), mo: mo[+p[1]-1] };
+}
+function durLabel(min){ var hh=Math.floor(min/60), mm=min%60; return (hh? hh+' ч':'') + (mm? ' '+mm+' мин':''); }
+
+function init(){
+  var headers = {};
+  if (tg && tg.initData) headers['X-Tg-Init-Data'] = tg.initData;
+  fetch('__API__/api/data', { headers: headers })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.ok) { $('app').innerHTML = '<div class="err">Открой меня через Telegram 💅<br><br><small>'+h(d.error||'')+'</small></div>'; return; }
+      D = d;
+      if (d.user && d.user.first_name && !form.name) form.name = d.user.first_name;
+      if (d.user && d.user.phone) form.phone = d.user.phone;
+      render();
+    })
+    .catch(function(){ $('app').innerHTML = '<div class="err">Не удалось загрузить данные 😔<br>Проверь интернет и открой заново</div>'; });
+}
+
+function render(){
+  var html = '';
+  if (view==='home') html = viewHome();
+  else if (view==='book') html = viewBook();
+  else if (view==='done') html = viewDone();
+  else if (view==='my') html = viewMy();
+  else if (view==='contacts') html = viewContacts();
+  $('app').innerHTML = '<div class="fade">'+html+'</div>';
+  renderCta();
+}
+
+function viewHome(){
+  var t = D.texts;
+  var s = '';
+  s += '<div class="logo"><div class="ring">💅</div><h1>DARWN.NAILL</h1><p>Дарина · мастер маникюра · стаж 3 года</p></div>';
+  if (t.promo) s += '<div class="card promo"><div class="tag">🔥 АКЦИЯ</div><div class="txt">'+nl2br(stripTags(t.promo))+'</div></div>';
+  s += '<div class="tabs">';
+  s += '<div class="tab active" onclick="go(\'home\')">💅 Услуги</div>';
+  s += '<div class="tab" onclick="go(\'my\')">📅 Записи</div>';
+  s += '<div class="tab" onclick="go(\'contacts\')">📍 Инфо</div>';
+  s += '</div>';
+  s += '<div class="sect">Выбери услугу</div>';
+  if (!D.services.length) s += '<div class="empty">Скоро здесь появятся услуги 🤍</div>';
+  for (var i=0;i<D.services.length;i++){
+    var sv = D.services[i];
+    s += '<div class="card svc" onclick="openSvc('+sv.id+')">';
+    s += '<div><div class="nm">'+h(sv.name)+'</div>';
+    if (sv.description) s += '<div class="ds">'+h(sv.description)+'</div>';
+    s += '<div class="dur">⏱ ~'+durLabel(sv.duration_min)+'</div></div>';
+    s += '<div class="pr"><b>'+sv.price+'₽</b><br><span class="go">Записаться</span></div>';
+    s += '</div>';
+  }
+  return s;
+}
+
+function viewMy(){
+  var s = '';
+  s += '<div class="logo"><div class="ring">📅</div><h1>МОИ ЗАПИСИ</h1></div>';
+  s += '<div class="tabs">';
+  s += '<div class="tab" onclick="go(\'home\')">💅 Услуги</div>';
+  s += '<div class="tab active" onclick="go(\'my\')">📅 Записи</div>';
+  s += '<div class="tab" onclick="go(\'contacts\')">📍 Инфо</div>';
+  s += '</div>';
+  if (!D.bookings.length) s += '<div class="empty">У тебя пока нет активных записей 🤍<br>Выбери услугу и запишись!</div>';
+  for (var i=0;i<D.bookings.length;i++){
+    var b = D.bookings[i]; var f = fmtDateLabel(b.date);
+    var st = b.status==='confirmed' ? '<span class="st c">✅ подтверждена</span>' : '<span class="st p">⏳ ждёт подтверждения</span>';
+    s += '<div class="card"><div class="bk"><div><b>'+f.dd+' '+f.mo+' · '+b.time+'</b><div class="ds" style="color:var(--muted);font-size:13px;margin-top:4px">'+h(b.service_name)+' · '+b.price+'₽</div></div>'+st+'</div>';
+    s += '<button class="cancel" onclick="cancelBk('+b.id+')">Отменить запись</button></div>';
+  }
+  return s;
+}
+
+function viewContacts(){
+  var t = D.texts;
+  var s = '';
+  s += '<div class="logo"><div class="ring">🤍</div><h1>ИНФО</h1></div>';
+  s += '<div class="tabs">';
+  s += '<div class="tab" onclick="go(\'home\')">💅 Услуги</div>';
+  s += '<div class="tab" onclick="go(\'my\')">📅 Записи</div>';
+  s += '<div class="tab active" onclick="go(\'contacts\')">📍 Инфо</div>';
+  s += '</div>';
+  s += '<div class="card"><div style="font-size:14px;line-height:1.65">'+nl2br(stripTags(t.about))+'</div></div>';
+  s += '<div class="card"><div style="font-size:14px;line-height:1.65">'+nl2br(stripTags(t.contacts))+'</div></div>';
+  if (t.master_link) s += '<a class="linkbtn" href="'+h(t.master_link)+'">💬 Написать Дарине</a>';
+  if (t.portfolio_url) s += '<a class="linkbtn" href="'+h(t.portfolio_url)+'">🖼 Портфолио</a>';
+  return s;
+}
+
+function viewBook(){
+  var sv = sel.svc;
+  var s = '';
+  s += '<span class="back" onclick="go(\'home\')">← Назад к услугам</span>';
+  s += '<div class="card"><div class="nm" style="font-weight:800;font-size:17px">'+h(sv.name)+'</div>';
+  if (sv.description) s += '<div class="ds" style="color:var(--muted);font-size:13px;margin-top:5px">'+h(sv.description)+'</div>';
+  s += '<div style="margin-top:8px;color:var(--muted);font-size:13px">💰 '+sv.price+'₽ · ⏱ ~'+durLabel(sv.duration_min)+'</div></div>';
+  s += '<div class="sect">Дата</div>';
+  var dates = Object.keys(D.slots).sort();
+  if (!dates.length) { s += '<div class="empty">Свободных окошек пока нет 😔<br>Загляни позже или напиши мастеру</div>'; }
+  else {
+    s += '<div class="dates">';
+    for (var i=0;i<dates.length;i++){
+      var f = fmtDateLabel(dates[i]);
+      s += '<div class="dchip'+(sel.date===dates[i]?' active':'')+'" onclick="pickDate(\''+dates[i]+'\')"><div class="wd">'+f.wd+'</div><div class="dd">'+f.dd+'</div><div class="wd">'+f.mo+'</div></div>';
+    }
+    s += '</div>';
+  }
+  if (sel.date && D.slots[sel.date]) {
+    s += '<div class="sect">Время</div><div class="times">';
+    var arr = D.slots[sel.date];
+    for (var j=0;j<arr.length;j++){
+      s += '<div class="tchip'+(sel.slotId===arr[j].id?' active':'')+'" onclick="pickSlot('+arr[j].id+',\''+arr[j].time+'\')">'+arr[j].time+'</div>';
+    }
+    s += '</div>';
+  }
+  if (sel.slotId) {
+    s += '<div class="sect">Как к тебе обращаться?</div>';
+    s += '<input class="inp" id="inName" placeholder="Имя" value="'+h(form.name)+'" oninput="form.name=this.value;updCta()">';
+    s += '<input class="inp" id="inPhone" placeholder="Телефон (необязательно)" value="'+h(form.phone)+'" oninput="form.phone=this.value">';
+  }
+  s += '<div style="height:76px"></div>';
+  return s;
+}
+
+function viewDone(){
+  var b = window._done;
+  var f = fmtDateLabel(b.date);
+  return '<div class="ok-screen"><div class="chk">🎉</div>' +
+    '<h2 style="font-size:22px">Ты записана!</h2>' +
+    '<p style="color:var(--muted);margin-top:10px;font-size:15px">'+f.dd+' '+f.mo+' в '+b.time+'<br>'+h(b.service_name)+' · '+b.price+'₽</p>' +
+    '<p style="color:var(--muted);margin-top:14px;font-size:13px">Дарина подтвердит запись и отправит адрес 💌</p>' +
+    '<a class="linkbtn" style="margin-top:24px" href="#" onclick="go(\'my\');return false;">📅 Мои записи</a>' +
+    '<a class="linkbtn" href="#" onclick="go(\'home\');return false;">💅 К услугам</a></div>';
+}
+
+function renderCta(){
+  var c = $('cta');
+  if (view==='book' && sel.slotId) {
+    c.innerHTML = '<button id="ctaBtn" onclick="submitBook()">✨ Записаться · '+sel.svc.price+'₽</button>';
+    updCta();
+  } else c.innerHTML = '';
+}
+function updCta(){
+  var b = $('ctaBtn');
+  if (b) b.disabled = sending || form.name.trim().length < 2;
+}
+function go(v){ haptic(); view=v; render(); }
+function openSvc(id){
+  haptic();
+  for (var i=0;i<D.services.length;i++) if (D.services[i].id===id) sel.svc = D.services[i];
+  sel.date=null; sel.slotId=null; sel.time=null;
+  view='book'; render();
+}
+function pickDate(d){ haptic(); sel.date=d; sel.slotId=null; sel.time=null; render(); }
+function pickSlot(id, t){ haptic('medium'); sel.slotId=id; sel.time=t; render(); setTimeout(function(){ window.scrollTo({top:document.body.scrollHeight, behavior:'smooth'}); }, 80); }
+
+function submitBook(){
+  if (sending) return;
+  if (form.name.trim().length < 2) { toast('Напиши имя 🙈'); return; }
+  sending = true; updCta();
+  haptic('heavy');
+  var headers = { 'content-type':'application/json' };
+  if (tg && tg.initData) headers['X-Tg-Init-Data'] = tg.initData;
+  fetch('__API__/api/book', {
+    method:'POST', headers: headers,
+    body: JSON.stringify({ slot_id: sel.slotId, service_id: sel.svc.id, name: form.name.trim(), phone: form.phone.trim() })
+  }).then(function(r){ return r.json().then(function(j){ return { status:r.status, j:j }; }); })
+    .then(function(res){
+      sending = false;
+      if (res.j.ok) {
+        try { if(tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success'); } catch(e){}
+        window._done = res.j.booking;
+        view='done';
+        refreshData(false);
+        render();
+      } else {
+        try { if(tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('error'); } catch(e){}
+        toast(res.j.error || 'Что-то пошло не так 😔');
+        refreshData(true);
+      }
+    })
+    .catch(function(){ sending=false; updCta(); toast('Нет связи, попробуй ещё раз 😔'); });
+}
+
+function cancelBk(id){
+  if (!confirm('Отменить запись?')) return;
+  haptic('medium');
+  var headers = { 'content-type':'application/json' };
+  if (tg && tg.initData) headers['X-Tg-Init-Data'] = tg.initData;
+  fetch('__API__/api/cancel', { method:'POST', headers:headers, body: JSON.stringify({ id:id }) })
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (j.ok) { toast('Запись отменена'); refreshData(true); }
+      else toast(j.error || 'Не получилось 😔');
+    });
+}
+
+function refreshData(rerender){
+  var headers = {};
+  if (tg && tg.initData) headers['X-Tg-Init-Data'] = tg.initData;
+  fetch('__API__/api/data', { headers:headers }).then(function(r){ return r.json(); }).then(function(d){
+    if (d.ok) { D = d; if (rerender) render(); }
+  });
+}
+
+init();
+</script>
+</body>
+</html>`;
+
+// ────────────────────────── РОУТЕР ──────────────────────────
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const origin = url.origin;
+
+    // Mini App
+    if (url.pathname === "/app") {
+      return new Response(MINI_APP_HTML.replaceAll("__API__", origin), {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // API мини-аппа
+    if (url.pathname.startsWith("/api/")) {
+      const initData = request.headers.get("X-Tg-Init-Data") || "";
+      const user = await validateInitData(initData, env.BOT_TOKEN);
+      if (!user) return json({ ok: false, error: "auth" }, 401);
+      if (url.pathname === "/api/data") return apiData(env, user);
+      if (url.pathname === "/api/book" && request.method === "POST")
+        return apiBook(env, user, await request.json().catch(() => ({})));
+      if (url.pathname === "/api/cancel" && request.method === "POST")
+        return apiCancel(env, user, await request.json().catch(() => ({})));
+      return json({ ok: false, error: "not_found" }, 404);
+    }
+
+    // Вебхук Telegram
+    if (url.pathname === `/webhook/${env.WEBHOOK_SECRET}` && request.method === "POST") {
+      const update = await request.json().catch(() => null);
+      if (update) {
+        ctx.waitUntil((async () => {
+          try {
+            if (update.message) await onMessage(env, update.message, origin);
+            else if (update.callback_query) await onCallback(env, update.callback_query, origin);
+          } catch (e) {
+            console.log("handle error", e && e.stack ? e.stack : String(e));
+          }
+        })());
+      }
+      return new Response("ok");
+    }
+
+    // Настройка вебхука и кнопки меню (открыть один раз после деплоя)
+    if (url.pathname === `/setup/${env.WEBHOOK_SECRET}`) {
+      const wh = await tg(env, "setWebhook", {
+        url: `${origin}/webhook/${env.WEBHOOK_SECRET}`,
+        drop_pending_updates: true,
+        allowed_updates: ["message", "callback_query"],
+      });
+      const mb = await tg(env, "setChatMenuButton", {
+        menu_button: { type: "web_app", text: "✨ Записаться", web_app: { url: `${origin}/app` } },
+      });
+      return json({ webhook: wh, menu_button: mb });
+    }
+
+    // Статус-страница
+    return new Response(
+      `<!DOCTYPE html><meta charset="utf-8"><body style="background:#14090f;color:#f5e9e2;font-family:sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center">
+       <div><div style="font-size:52px">💅</div><h1>DARWN.NAILL</h1><p>Бот работает ✨ Запись — через Telegram</p></div></body>`,
+      { headers: { "content-type": "text/html; charset=utf-8" } }
+    );
+  },
+
+  // Напоминания о завтрашних записях (cron из wrangler.toml)
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil((async () => {
+      const tomorrow = addDays(todayStr(env), 1);
+      const { results } = await env.DB.prepare(
+        "SELECT * FROM bookings WHERE date=? AND status='confirmed' AND reminded=0"
+      ).bind(tomorrow).all();
+      for (const b of results || []) {
+        const r = await send(env, b.user_id,
+          `💌 <b>Напоминание о записи</b>\n\nЗавтра, <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)}\n\nЖду тебя, красотка! 🤍`);
+        if (r.ok) await env.DB.prepare("UPDATE bookings SET reminded=1 WHERE id=?").bind(b.id).run();
+      }
+    })());
+  },
+};

@@ -1,0 +1,28 @@
+# ═══════════════════════════════════════════════════════════
+#  💅 DARWN.NAILL — конфиг Cloudflare Worker
+#  👇 ЗАПОЛНИ 3 МЕСТА, ОТМЕЧЕННЫЕ «← ВПИШИ» (прямо на GitHub, кнопка ✏️)
+# ═══════════════════════════════════════════════════════════
+name = "darwn-naill-bot"
+main = "worker.js"
+compatibility_date = "2024-11-11"
+
+[vars]
+# Твой Telegram ID (узнать: @userinfobot)
+ADMIN_ID = "000000000"          # ← ВПИШИ свой ID вместо нулей
+# Любая случайная строка — защита вебхука (придумай сама)
+WEBHOOK_SECRET = "change-me"    # ← ВПИШИ случайную строку
+# Часовой пояс (Новосибирск = 7)
+TZ_OFFSET_HOURS = "7"
+
+# База D1 (создаётся на сайте Cloudflare, см. DEPLOY-WEB.md шаг 3)
+[[d1_databases]]
+binding = "DB"
+database_name = "darwn_naill_db"
+database_id = "00000000-0000-0000-0000-000000000000"   # ← ВПИШИ Database ID со страницы базы
+
+# Напоминания клиентам накануне записи (12:00 UTC = 19:00 Новосибирск)
+[triggers]
+crons = ["0 12 * * *"]
+
+# ⚠️ BOT_TOKEN сюда НЕ пишем! Он задаётся как Secret:
+# Workers & Pages → darwn-naill-bot → Settings → Variables and Secrets → Add → тип Secret
