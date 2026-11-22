@@ -41,6 +41,7 @@ const WEEKDAYS_SHORT = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"];
 const MONTHS_GEN = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
 const TIME_PRESETS = ["09:00","10:00","11:00","12:00","13:00","14:00","15:00","16:00","17:00","18:00","19:00","20:00"];
 const DAYS_AHEAD = 14;
+const MAPS_URL = "https://yandex.ru/maps/?text=" + encodeURIComponent("г. Бердск, ул. Вокзальная, 2");
 const LEAD_MIN = 60; // за сколько минут до начала окошко закрывается
 
 // ────────────────────────── УТИЛИТЫ ──────────────────────────
@@ -133,6 +134,9 @@ async function upsertUser(env, from) {
     `INSERT INTO users (telegram_id, username, first_name) VALUES (?,?,?)
      ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name`
   ).bind(from.id, from.username || null, from.first_name || "").run();
+}
+async function dbAll(env, sql, ...binds) {
+  try { return (await env.DB.prepare(sql).bind(...binds).all()).results || []; } catch { return []; }
 }
 async function getUser(env, id) {
   return env.DB.prepare("SELECT * FROM users WHERE telegram_id=?").bind(id).first();
@@ -243,6 +247,7 @@ async function screenContacts(env) {
   const t = await getTexts(env);
   const rows = [];
   if (t.master_link) rows.push([urlBtn("💬 Написать Дарине", t.master_link)]);
+  rows.push([urlBtn("🧭 Как добраться", MAPS_URL)]);
   if (t.portfolio_url) rows.push([urlBtn("🖼 Портфолио", t.portfolio_url)]);
   rows.push([btn("⬅️ В меню", "m")]);
   return { text: t.contacts_text, keyboard: rows };
@@ -430,7 +435,22 @@ async function screenAdminServiceCard(env, id) {
       [btn("✏️ Название", `a:sv:e:name:${s.id}`), btn("💰 Цена", `a:sv:e:price:${s.id}`)],
       [btn("⏱ Длительность", `a:sv:e:dur:${s.id}`), btn("📝 Описание", `a:sv:e:desc:${s.id}`)],
       [btn(s.active ? "💤 Скрыть" : "✨ Показать", `a:sv:tg:${s.id}`), btn("🗑 Удалить", `a:sv:del:${s.id}`)],
+      [btn("📸 Фото работ", `a:sv:ph:${s.id}`)],
       [btn("⬅️ К услугам", "a:sv")],
+    ],
+  };
+}
+
+async function screenAdminServicePhotos(env, id) {
+  const s = await env.DB.prepare("SELECT * FROM services WHERE id=?").bind(id).first();
+  if (!s) return screenAdminServices(env);
+  const photos = await dbAll(env, "SELECT file_id FROM service_photos WHERE service_id=? ORDER BY sort, id", id);
+  return {
+    text: `📸 <b>Фото работ · ${html(s.name)}</b>\n\nСейчас: <b>${photos.length}</b> шт.\n\n<i>Фото показываются в мини-приложении на странице услуги</i>`,
+    keyboard: [
+      [btn("➕ Добавить фото", `a:sv:pha:${id}`)],
+      ...(photos.length ? [[btn("🗑 Удалить все фото", `a:sv:phd:${id}`)]] : []),
+      [btn("⬅️ К услуге", `a:sv:${id}`)],
     ],
   };
 }
@@ -544,6 +564,14 @@ async function onMessage(env, msg, appUrl) {
       await show(env, { chatId }, await screenAdminServiceCard(env, r.meta.last_row_id));
       return;
     }
+    // загрузка фото работ
+    if (st === "adm_svc_photo") {
+      const photo = msg.photo && msg.photo.length ? msg.photo[msg.photo.length - 1].file_id : null;
+      if (!photo) return send(env, chatId, "🙈 Это не фото. Пришли фото или /cancel");
+      await env.DB.prepare("INSERT INTO service_photos (service_id, file_id) VALUES (?,?)").bind(p.id, photo).run();
+      const cnt = await env.DB.prepare("SELECT COUNT(*) n FROM service_photos WHERE service_id=?").bind(p.id).first();
+      return send(env, chatId, `✅ Фото добавлено! Всего у услуги: <b>${cnt.n}</b>\nПришли ещё или /cancel — готово`);
+    }
     // редактирование услуги
     if (st === "adm_svc_edit") {
       const fields = { name: "name", price: "price", dur: "duration_min", desc: "description" };
@@ -653,7 +681,7 @@ async function onCallback(env, cb, appUrl) {
       await answer(env, cb.id, "✅ Подтверждено");
       await send(env, b.user_id,
         `✅ <b>Запись подтверждена!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\nЖду тебя, красотка 🤍\n📍 <i>г. Бердск, ул. Вокзальная, 2 💌</i>`,
-        { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))]]) });
+        { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))], [urlBtn("🧭 Как добраться", MAPS_URL)]]) });
     } else {
       await cancelBooking(env, id, true);
       await answer(env, cb.id, "❌ Запись отменена, окошко освобождено");
@@ -706,6 +734,25 @@ async function onCallback(env, cb, appUrl) {
     await setState(env, from.id, "adm_svc_name", {});
     await answer(env, cb.id);
     return send(env, chatId, "💅 <b>Новая услуга</b>\n\nВведи название (например <code>Маникюр + гель-лак</code>):");
+  }
+  if (parts[1] === "sv" && parts[2] === "ph") {
+    const id = +parts[3];
+    await answer(env, cb.id);
+    const photos = await dbAll(env, "SELECT file_id FROM service_photos WHERE service_id=? ORDER BY sort, id", id);
+    await show(env, c, await screenAdminServicePhotos(env, id));
+    if (photos.length)
+      await tg(env, "sendMediaGroup", { chat_id: chatId, media: photos.slice(0, 10).map((p) => ({ type: "photo", media: p.file_id })) });
+    return;
+  }
+  if (parts[1] === "sv" && parts[2] === "pha") {
+    await setState(env, from.id, "adm_svc_photo", { id: +parts[3] });
+    await answer(env, cb.id);
+    return send(env, chatId, "📸 Присылай фото работ — по одному или несколько.\nОни появятся на странице услуги в мини-приложении ✨\n\n<i>/cancel — закончить</i>");
+  }
+  if (parts[1] === "sv" && parts[2] === "phd") {
+    await env.DB.prepare("DELETE FROM service_photos WHERE service_id=?").bind(+parts[3]).run();
+    await answer(env, cb.id, "🗑 Фото удалены");
+    return show(env, c, await screenAdminServiceCard(env, +parts[3]));
   }
   if (parts[1] === "sv" && parts[2] === "e") {
     const [, , , field, id] = parts;
@@ -815,21 +862,55 @@ async function apiData(env, user) {
   await upsertUser(env, user);
   const u = await getUser(env, user.id);
   const services = (await env.DB.prepare("SELECT id, name, description, price, duration_min FROM services WHERE active=1 ORDER BY sort, id").all()).results || [];
+  const photos = await dbAll(env, "SELECT service_id, file_id FROM service_photos ORDER BY sort, id");
+  for (const s of services) s.photos = photos.filter((p) => p.service_id === s.id).map((p) => p.file_id);
   const slots = {};
   for (const s of await freeSlots(env)) {
     (slots[s.date] = slots[s.date] || []).push({ id: s.id, time: s.time });
   }
-  const bookings = (await env.DB.prepare(
-    "SELECT id, service_name, price, date, time, status FROM bookings WHERE user_id=? AND status IN ('pending','confirmed') AND date>=? ORDER BY date, time"
-  ).bind(user.id, todayStr(env)).all()).results || [];
+  const today = todayStr(env);
+  const bookings = await dbAll(env,
+    "SELECT id, service_name, price, date, time, status FROM bookings WHERE user_id=? AND status IN ('pending','confirmed') AND date>=? ORDER BY date, time",
+    user.id, today);
+  const past = await dbAll(env,
+    `SELECT b.id, b.service_name, b.price, b.date, b.time,
+            (SELECT COUNT(*) FROM reviews r WHERE r.booking_id = b.id) AS has_review
+     FROM bookings b WHERE b.user_id=? AND b.status='confirmed' AND b.date<? ORDER BY b.date DESC LIMIT 10`,
+    user.id, today);
+  const reviews = await dbAll(env, "SELECT name, rating, text, created_at FROM reviews WHERE visible=1 ORDER BY id DESC LIMIT 20");
+  let revAgg = { n: 0, a: 0 };
+  try { revAgg = await env.DB.prepare("SELECT COUNT(*) n, AVG(rating) a FROM reviews WHERE visible=1").first(); } catch {}
   const texts = await getTexts(env);
   return json({
     ok: true,
     user: { id: user.id, first_name: user.first_name, username: user.username, phone: (u && u.phone) || "" },
-    services, slots, bookings,
+    services, slots, bookings, past, reviews,
+    rating: { count: revAgg.n || 0, avg: revAgg.a ? Math.round(revAgg.a * 10) / 10 : 0 },
     texts: { about: texts.about_text, contacts: texts.contacts_text, promo: texts.promo_text, portfolio_url: texts.portfolio_url, master_link: texts.master_link },
     is_admin: isAdmin(env, user.id),
   });
+}
+
+async function apiReview(env, user, body) {
+  const b = await env.DB.prepare("SELECT * FROM bookings WHERE id=?").bind(+(body || {}).booking_id).first();
+  if (!b || b.user_id !== user.id) return json({ ok: false, error: "Запись не найдена 🙈" }, 404);
+  if (b.status !== "confirmed") return json({ ok: false, error: "Отзыв можно оставить после подтверждённого визита 🙈" }, 400);
+  const rating = parseInt(body.rating, 10) || 0;
+  if (rating < 1 || rating > 5) return json({ ok: false, error: "Выбери оценку ⭐" }, 400);
+  const exists = await dbAll(env, "SELECT id FROM reviews WHERE booking_id=?", b.id);
+  if (exists.length) return json({ ok: false, error: "Отзыв уже оставлен 🤍" }, 409);
+  const text = String(body.text || "").trim().slice(0, 500);
+  const u = await getUser(env, user.id);
+  const name = (u && u.first_name) || "Гость";
+  await env.DB.prepare("INSERT INTO reviews (user_id, booking_id, name, username, rating, text) VALUES (?,?,?,?,?,?)")
+    .bind(user.id, b.id, name, (u && u.username) || "", rating, text).run();
+  const stars = "★".repeat(rating) + "☆".repeat(5 - rating);
+  const ids = (env.ADMIN_ID || "").split(",").map((s) => s.trim()).filter(Boolean);
+  for (const id of ids)
+    await send(env, id,
+      `⭐ <b>Новый отзыв!</b>\n\n${stars}\n👤 ${html(name)}${b.client_username ? ` @${b.client_username}` : ""}\n💅 ${html(b.service_name)}` +
+      (text ? `\n\n<i>${html(text.slice(0, 300))}</i>` : ""));
+  return json({ ok: true });
 }
 
 async function apiBook(env, user, body) {
@@ -846,8 +927,8 @@ async function apiBook(env, user, body) {
   const b = res.booking;
   await notifyAdminNewBooking(env, b);
   await send(env, user.id,
-    `🎉 <b>Ты записана!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\n⏳ Я подтвержу запись в ближайшее время и отправлю адрес 💌`,
-    { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))]]) });
+    `🎉 <b>Ты записана!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\n⏳ Подтвержу запись в ближайшее время 💌\n📍 Адрес: г. Бердск, ул. Вокзальная, 2`,
+    { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))], [urlBtn("🧭 Как добраться", MAPS_URL)]]) });
   return json({ ok: true, booking: { id: b.id, date: b.date, time: b.time, service_name: b.service_name, price: b.price, date_label: dateLabel(b.date) } });
 }
 
@@ -874,14 +955,16 @@ async function apiAdmin(env, path, body) {
        LEFT JOIN bookings b ON b.id = s.booking_id WHERE s.date>=? ORDER BY s.date, s.time LIMIT 400`
     ).bind(today).all()).results || [];
     const services = (await env.DB.prepare("SELECT * FROM services ORDER BY sort, id").all()).results || [];
+    const reviews = await dbAll(env, "SELECT * FROM reviews ORDER BY id DESC LIMIT 50");
     const texts = await getTexts(env);
     const one = async (q, ...b) => (await env.DB.prepare(q).bind(...b).first()).n;
-    return json({ ok: true, today, bookings, slots, services, texts, stats: {
+    return json({ ok: true, today, bookings, slots, services, reviews, texts, stats: {
       users: await one("SELECT COUNT(*) n FROM users"),
       upcoming: await one("SELECT COUNT(*) n FROM bookings WHERE status IN ('pending','confirmed') AND date>=?", today),
       pending: await one("SELECT COUNT(*) n FROM bookings WHERE status='pending' AND date>=?", today),
       free_slots: await one("SELECT COUNT(*) n FROM slots WHERE status='free' AND date>=?", today),
       revenue: await one("SELECT COALESCE(SUM(price),0) n FROM bookings WHERE status='confirmed' AND date>=?", today),
+      new_reviews: reviews.filter((r) => r.visible).length,
     }});
   }
   if (path === "/api/admin/booking") {
@@ -891,7 +974,7 @@ async function apiAdmin(env, path, body) {
       await env.DB.prepare("UPDATE bookings SET status='confirmed' WHERE id=?").bind(b.id).run();
       await send(env, b.user_id,
         `✅ <b>Запись подтверждена!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\nЖду тебя, красотка 🤍\n📍 <i>г. Бердск, ул. Вокзальная, 2 💌</i>`,
-        { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))]]) });
+        { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))], [urlBtn("🧭 Как добраться", MAPS_URL)]]) });
     } else {
       await cancelBooking(env, b.id, true);
       await send(env, b.user_id,
@@ -943,6 +1026,30 @@ async function apiAdmin(env, path, body) {
     await env.DB.prepare("INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
       .bind(body.key, String(body.value || "")).run();
     return json({ ok: true });
+  }
+  if (path === "/api/admin/review") {
+    const id = +body.id;
+    if (body.action === "del") await env.DB.prepare("DELETE FROM reviews WHERE id=?").bind(id).run();
+    else await env.DB.prepare("UPDATE reviews SET visible=? WHERE id=?").bind(body.action === "show" ? 1 : 0, id).run();
+    return json({ ok: true });
+  }
+  if (path === "/api/admin/slots/gen") {
+    const days = (Array.isArray(body.days) ? body.days : []).map(Number).filter((d) => d >= 0 && d <= 6);
+    const times = (Array.isArray(body.times) ? body.times : []).filter((t) => /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(t)));
+    if (!days.length || !times.length) return json({ ok: false, error: "Выбери дни и время 🙈" }, 400);
+    let added = 0;
+    for (let i = 0; i < 28; i++) {
+      const d = addDays(today, i);
+      const [y, m, dd] = d.split("-").map(Number);
+      const wd = new Date(Date.UTC(y, m - 1, dd)).getUTCDay();
+      if (!days.includes(wd)) continue;
+      for (const t of times) {
+        const [h1, m1] = String(t).split(":");
+        const r = await env.DB.prepare("INSERT OR IGNORE INTO slots (date, time) VALUES (?,?)").bind(d, `${pad2(+h1)}:${m1}`).run();
+        added += (r.meta && r.meta.changes) || 0;
+      }
+    }
+    return json({ ok: true, added });
   }
   if (path === "/api/admin/broadcast") {
     const text = String(body.text || "").trim();
@@ -1070,7 +1177,28 @@ const MINI_APP_HTML = String.raw`<!DOCTYPE html>
   .cancel { display:block; width:100%; font-size:13px; font-weight:600; color:var(--red); background:rgba(255,143,163,.07); border:1px solid rgba(255,143,163,.35); border-radius:13px; padding:11px 12px; cursor:pointer; margin-top:12px; transition:.15s; }
   .cancel:active { transform:scale(.98); background:rgba(255,143,163,.14); }
 
-  .linkbtn { display:block; text-align:center; padding:14px; border-radius:15px; background:var(--card); border:1px solid var(--card-border); color:var(--text); text-decoration:none; font-weight:600; font-size:14.5px; margin-top:10px; }
+  .gal{display:flex;gap:8px;overflow-x:auto;padding:4px 2px 10px;-webkit-overflow-scrolling:touch}
+.gal img{width:110px;height:110px;object-fit:cover;border-radius:14px;border:1px solid var(--line);flex:none;cursor:pointer}
+.phwrap{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:60;align-items:center;justify-content:center}
+.phwrap.on{display:flex}
+.phwrap img{max-width:92vw;max-height:80vh;border-radius:16px}
+.phwrap .phx{position:absolute;top:18px;right:20px;font-size:26px;color:#fff;opacity:.8;cursor:pointer}
+.pgnav{display:flex;align-items:center;gap:10px}
+.pgnav span{font-size:18px;color:#fff;opacity:.75;padding:8px 14px;cursor:pointer;user-select:none}
+.stars{display:flex;justify-content:center;gap:6px;margin:14px 0}
+.stars span{font-size:34px;cursor:pointer;transition:transform .12s}
+.stars span.on{transform:scale(1.12)}
+.rev{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:16px;padding:12px 14px;margin-top:10px}
+.rev .rh{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.rev .rn{font-weight:700;font-size:14px}
+.rev .rs{color:var(--accent);letter-spacing:2px;font-size:13px;white-space:nowrap}
+.rev .rt{color:var(--muted);font-size:13px;line-height:1.55;margin-top:6px}
+.ratepill{display:inline-block;background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:999px;padding:5px 14px;font-size:13px;color:var(--muted)}
+.ratepill b{color:var(--accent)}
+.wdgrid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-top:8px}
+.wdchip{text-align:center;padding:10px 0 8px;border-radius:12px;background:rgba(255,255,255,.04);border:1px solid var(--line);font-size:12px;color:var(--muted);cursor:pointer}
+.wdchip.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.linkbtn { display:block; text-align:center; padding:14px; border-radius:15px; background:var(--card); border:1px solid var(--card-border); color:var(--text); text-decoration:none; font-weight:600; font-size:14.5px; margin-top:10px; }
   .back { color:var(--muted); font-size:14px; cursor:pointer; padding:6px 0; display:inline-block; }
   .ok-screen { text-align:center; padding-top:60px; }
   .ok-screen .chk { width:92px; height:92px; margin:0 auto 18px; border-radius:50%; background:var(--grad); display:flex; align-items:center; justify-content:center; font-size:44px; box-shadow:0 12px 40px rgba(217,154,108,.5); animation:pop .5s cubic-bezier(.2,1.6,.4,1); }
@@ -1118,6 +1246,9 @@ var AD = null;          // данные админки
 var admSlotDate = null; // выбранная дата в добавлении окошка
 var editSvc = null;     // редактируемая услуга
 var editTextKey = null; // редактируемый текст
+var revView = { id:null, name:'', rating:0 };
+var genDays = [];
+var genTimes = {};
 var API_URL = '__API__';
 
 function apiPost(path, body){
@@ -1138,6 +1269,7 @@ function tabsHtml(active){
   s += '<div class="tab'+(active==='home'?' active':'')+'" onclick="go(\'home\')">💅 Услуги</div>';
   s += '<div class="tab'+(active==='my'?' active':'')+'" onclick="go(\'my\')">📅 Записи</div>';
   s += '<div class="tab'+(active==='contacts'?' active':'')+'" onclick="go(\'contacts\')">📍 Инфо</div>';
+  s += '<div class="tab'+(active==='revs'?' active':'')+'" onclick="go(\'revs\')">⭐</div>';
   if (D.is_admin) s += '<div class="tab'+(active==='adm'?' active':'')+'" onclick="goAdmin()">👑</div>';
   return s + '</div>';
 }
@@ -1181,6 +1313,7 @@ function render(){
   else if (view==='book') html = viewBook();
   else if (view==='done') html = viewDone();
   else if (view==='my') html = viewMy();
+  else if (view==='revs') html = viewRevs();
   else if (view==='contacts') html = viewContacts();
   else if (view==='adm') html = viewAdmin();
   else if (view==='adm_bk') html = viewAdminBk();
@@ -1190,6 +1323,9 @@ function render(){
   else if (view==='adm_sv_edit') html = viewAdminSvEdit();
   else if (view==='adm_tx') html = viewAdminTx();
   else if (view==='adm_tx_edit') html = viewAdminTxEdit();
+  else if (view==='adm_sl_gen') html = viewAdminSlGen();
+  else if (view==='adm_rv') html = viewAdminRv();
+  else if (view==='review') html = viewReview();
   else if (view==='adm_bc') html = viewAdminBc();
   $('app').innerHTML = '<div class="fade">'+html+'</div>';
   renderCta();
@@ -1201,6 +1337,7 @@ function viewHome(){
   s += '<div class="logo"><div class="ring">💅</div><h1>DARWN.NAILL</h1><p>Дарина · мастер маникюра · стаж 3 года</p></div>';
   if (t.promo) s += '<div class="card promo"><div class="tag">🔥 АКЦИЯ</div><div class="txt">'+nl2br(stripTags(t.promo))+'</div></div>';
   s += tabsHtml('home');
+  if (D.rating && D.rating.count > 0) s += '<div style="text-align:center;margin:2px 0 4px"><span class="ratepill" onclick="go(\'revs\')"><b>★ '+D.rating.avg+'</b> · '+D.rating.count+' отзывов 🤍</span></div>';
   s += '<div class="sect">Выбери услугу</div>';
   if (!D.services.length) s += '<div class="empty">Скоро здесь появятся услуги 🤍</div>';
   for (var i=0;i<D.services.length;i++){
@@ -1209,6 +1346,7 @@ function viewHome(){
     s += '<div><div class="nm">'+h(sv.name)+'</div>';
     if (sv.description) s += '<div class="ds">'+h(sv.description)+'</div>';
     s += '<div class="dur">⏱ ~'+durLabel(sv.duration_min)+'</div></div>';
+    if (sv.photos && sv.photos.length) s += '<div class="gal">'+sv.photos.map(function(p){ return '<img loading="lazy" src="/photo/'+encodeURIComponent(p)+'" onclick="event.stopPropagation();photoView(this.src)">'; }).join('')+'</div>';
     s += '<div class="pr"><b>'+sv.price+'₽</b><br><span class="go">Записаться</span></div>';
     s += '</div>';
   }
@@ -1226,7 +1364,70 @@ function viewMy(){
     s += '<div class="card"><div class="bk"><div><b>'+f.dd+' '+f.mo+' · '+b.time+'</b><div class="ds" style="color:var(--muted);font-size:13px;margin-top:4px">'+h(b.service_name)+' · '+b.price+'₽</div></div>'+st+'</div>';
     s += '<button class="cancel" onclick="cancelBk('+b.id+')">Отменить запись</button></div>';
   }
+  if (D.past && D.past.length){
+    var pend = D.past.filter(function(p){ return !p.has_review; });
+    if (pend.length) s += '<div class="sect">Как прошёл визит? 💌</div>';
+    for (var k=0;k<pend.length;k++){
+      var pb = pend[k]; var pf = fmtDateLabel(pb.date);
+      s += '<div class="card"><div class="bk"><div><b>'+pf.dd+' '+pf.mo+' · '+pb.time+'</b><div class="ds" style="color:var(--muted);font-size:13px;margin-top:4px">'+h(pb.service_name)+'</div></div></div>';
+      s += '<button class="cancel" style="border-color:var(--accent);color:var(--accent)" onclick="openReview('+pb.id+')">⭐ Оставить отзыв</button></div>';
+    }
+  }
   return s;
+}
+
+function starsStr(n){ var s=''; for (var i=1;i<=5;i++) s += i<=n ? '★' : '☆'; return s; }
+function viewRevs(){
+  var s = '';
+  s += '<div class="logo"><div class="ring">⭐</div><h1>ОТЗЫВЫ</h1></div>';
+  s += tabsHtml('revs');
+  if (D.rating && D.rating.count > 0) s += '<div style="text-align:center;margin:6px 0 2px"><span class="ratepill"><b>★ '+D.rating.avg+'</b> на основе '+D.rating.count+' отзывов</span></div>';
+  if (!D.reviews || !D.reviews.length) s += '<div class="empty">Пока пусто — стань первой, кто оставит отзыв 🤍</div>';
+  for (var i=0;i<(D.reviews||[]).length;i++){
+    var r = D.reviews[i];
+    s += '<div class="rev"><div class="rh"><span class="rn">'+h(r.name)+'</span><span class="rs">'+starsStr(r.rating)+'</span></div>';
+    if (r.text) s += '<div class="rt">'+h(r.text)+'</div>';
+    s += '</div>';
+  }
+  return s;
+}
+function viewReview(){
+  var s = '';
+  s += '<span class="back" onclick="go(\'my\')">← Назад</span>';
+  s += '<div class="logo"><div class="ring">💅</div><h1>КАК ТЕБЕ?</h1><p>'+h(revView.name)+'</p></div>';
+  s += '<div class="stars">';
+  for (var i=1;i<=5;i++) s += '<span id="st'+i+'" class="'+(revView.rating>=i?'on':'')+'" onclick="setRating('+i+')">'+(revView.rating>=i?'★':'☆')+'</span>';
+  s += '</div>';
+  s += '<textarea class="inp" id="revText" rows="4" placeholder="Пара слов о визите (необязательно) 🤍" style="resize:none"></textarea>';
+  s += '<button class="abtn ok" style="width:100%;margin-top:12px" onclick="submitReview()">Отправить 🤍</button>';
+  return s;
+}
+function setRating(n){ revView.rating = n; haptic(); for (var i=1;i<=5;i++){ var el=$('st'+i); el.textContent = i<=n?'★':'☆'; el.className = i<=n?'on':''; } }
+function openReview(bkId){
+  var b = null;
+  for (var i=0;i<(D.past||[]).length;i++) if (D.past[i].id===bkId) b = D.past[i];
+  if (!b) return;
+  revView = { id:b.id, name:b.service_name, rating:0 };
+  go('review');
+}
+function submitReview(){
+  if (!revView.rating) { toast('Выбери оценку ⭐'); return; }
+  haptic('medium');
+  var text = ($('revText') ? $('revText').value : '').trim();
+  apiPost('/api/review', { booking_id: revView.id, rating: revView.rating, text: text }).then(function(d){
+    if (d.ok) {
+      var pb = null;
+      for (var i=0;i<(D.past||[]).length;i++) if (D.past[i].id===revView.id) pb = D.past[i];
+      if (pb) pb.has_review = 1;
+      toast('Спасибо за отзыв! 🤍'); refreshData(false); go('my');
+    } else toast(d.error || 'Ошибка 😔');
+  });
+}
+function photoView(src){
+  var w = document.createElement('div'); w.className = 'phwrap on';
+  w.innerHTML = '<span class="phx">✕</span><img src="'+src+'">';
+  w.onclick = function(){ w.remove(); };
+  document.body.appendChild(w);
 }
 
 function viewContacts(){
@@ -1236,6 +1437,7 @@ function viewContacts(){
   s += tabsHtml('contacts');
   s += '<div class="card"><div style="font-size:14px;line-height:1.65">'+nl2br(stripTags(t.about))+'</div></div>';
   s += '<div class="card"><div style="font-size:14px;line-height:1.65">'+nl2br(stripTags(t.contacts))+'</div></div>';
+  s += '<a class="linkbtn" href="https://yandex.ru/maps/?text=%D0%B3.%20%D0%91%D0%B5%D1%80%D0%B4%D1%81%D0%BA%2C%20%D1%83%D0%BB.%20%D0%92%D0%BE%D0%BA%D0%B7%D0%B0%D0%BB%D1%8C%D0%BD%D0%B0%D1%8F%2C%202" target="_blank" rel="noopener">🧭 Как добраться</a>';
   if (t.master_link) s += '<a class="linkbtn" href="'+h(t.master_link)+'">💬 Написать Дарине</a>';
   if (t.portfolio_url) s += '<a class="linkbtn" href="'+h(t.portfolio_url)+'">🖼 Портфолио</a>';
   return s;
@@ -1248,6 +1450,7 @@ function viewBook(){
   s += '<div class="card"><div class="nm" style="font-weight:800;font-size:17px">'+h(sv.name)+'</div>';
   if (sv.description) s += '<div class="ds" style="color:var(--muted);font-size:13px;margin-top:5px">'+h(sv.description)+'</div>';
   s += '<div style="margin-top:8px;color:var(--muted);font-size:13px">💰 '+sv.price+'₽ · ⏱ ~'+durLabel(sv.duration_min)+'</div></div>';
+  if (sv.photos && sv.photos.length) { s += '<div class="sect">Примеры работ</div><div class="gal">'+sv.photos.map(function(p){ return '<img loading="lazy" src="/photo/'+encodeURIComponent(p)+'" onclick="photoView(this.src)">'; }).join('')+'</div>'; }
   s += '<div class="sect">Дата</div>';
   var dates = Object.keys(D.slots).sort();
   if (!dates.length) { s += '<div class="empty">Свободных окошек пока нет 😔<br>Загляни позже или напиши мастеру</div>'; }
@@ -1282,8 +1485,9 @@ function viewDone(){
   return '<div class="ok-screen"><div class="chk">🎉</div>' +
     '<h2 style="font-size:22px">Ты записана!</h2>' +
     '<p style="color:var(--muted);margin-top:10px;font-size:15px">'+f.dd+' '+f.mo+' в '+b.time+'<br>'+h(b.service_name)+' · '+b.price+'₽</p>' +
-    '<p style="color:var(--muted);margin-top:14px;font-size:13px">Дарина подтвердит запись и отправит адрес 💌</p>' +
-    '<a class="linkbtn" style="margin-top:24px" href="#" onclick="go(\'my\');return false;">📅 Мои записи</a>' +
+    '<p style="color:var(--muted);margin-top:14px;font-size:13px">Дарина подтвердит запись 💌<br>📍 г. Бердск, ул. Вокзальная, 2</p>' +
+    '<a class="linkbtn" style="margin-top:22px" href="https://yandex.ru/maps/?text=%D0%B3.%20%D0%91%D0%B5%D1%80%D0%B4%D1%81%D0%BA%2C%20%D1%83%D0%BB.%20%D0%92%D0%BE%D0%BA%D0%B7%D0%B0%D0%BB%D1%8C%D0%BD%D0%B0%D1%8F%2C%202" target="_blank" rel="noopener">🧭 Как добраться</a>' +
+    '<a class="linkbtn" href="#" onclick="go(\'my\');return false;">📅 Мои записи</a>' +
     '<a class="linkbtn" href="#" onclick="go(\'home\');return false;">💅 К услугам</a></div>';
 }
 
@@ -1376,6 +1580,7 @@ function viewAdmin(){
   s += '<div class="card menurow" onclick="go(\'adm_sv\')">💅 Услуги<span style="color:var(--muted)">→</span></div>';
   s += '<div class="card menurow" onclick="go(\'adm_tx\')">✏️ Тексты<span style="color:var(--muted)">→</span></div>';
   s += '<div class="card menurow" onclick="go(\'adm_bc\')">📣 Рассылка<span style="color:var(--muted)">→</span></div>';
+  s += '<div class="card menurow" onclick="go(\'adm_rv\')">⭐ Отзывы'+(st.new_reviews?'<span class="badge">'+st.new_reviews+'</span>':'<span style="color:var(--muted)">→</span>')+'</div>';
   return s;
 }
 
@@ -1410,6 +1615,7 @@ function viewAdminSl(){
   s += '<button class="abtn ok" style="flex:1" onclick="go(\'adm_sl_add\')">➕ Добавить</button>';
   s += '<button class="abtn no" style="flex:1" onclick="admSlotsClear()">🧨 Удалить все</button>';
   s += '</div>';
+  s += '<button class="abtn" style="width:100%;margin-top:8px" onclick="go(\'adm_sl_gen\')">⚡ Генератор окошек</button>';
   if (!AD.slots.length) s += '<div class="empty">Окошек нет — добавь первое 👆</div>';
   var byDate = {};
   for (var i=0;i<AD.slots.length;i++){ var sl = AD.slots[i]; (byDate[sl.date]=byDate[sl.date]||[]).push(sl); }
@@ -1477,6 +1683,65 @@ function admSlotAdd(time){
   haptic('medium');
   apiPost('/api/admin/slot/add', { date:admSlotDate, time:time }).then(function(d){
     if (d.ok) { toast('✅ Окошко '+time+' добавлено'); refreshAdmin(); refreshData(false); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+
+function viewAdminSlGen(){
+  var s = admHead('Генератор окошек');
+  s += '<div style="color:var(--muted);font-size:13px;line-height:1.5;margin:2px 0 4px">Выбери дни недели и время — окошки создадутся на 4 недели вперёд. Уже существующие не дублируются ✨</div>';
+  s += '<div class="sect">Дни недели</div><div class="wdgrid">';
+  var wd = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
+  var wdNum = [1,2,3,4,5,6,0];
+  for (var i=0;i<7;i++){
+    var on = genDays.indexOf(wdNum[i]) >= 0;
+    s += '<div class="wdchip'+(on?' active':'')+'" onclick="genToggleDay('+wdNum[i]+')">'+wd[i]+'</div>';
+  }
+  s += '</div>';
+  s += '<div class="sect">Время</div><div class="times">';
+  var presets = ['09:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00','20:00'];
+  for (var j=0;j<presets.length;j++){
+    var t = presets[j]; var on2 = !!genTimes[t];
+    s += '<div class="tchip'+(on2?' active':'')+'" onclick="genToggleTime(\''+t+'\')">'+t+'</div>';
+  }
+  s += '</div>';
+  var cnt = genDays.length * Object.keys(genTimes).length * 4;
+  s += '<button class="abtn ok" style="width:100%;margin-top:14px" onclick="admSlotsGen()">⚡ Создать'+(cnt?(' (до '+cnt+' окошек)'):'')+'</button>';
+  return s;
+}
+function genToggleDay(d){ haptic(); var i = genDays.indexOf(d); if (i>=0) genDays.splice(i,1); else genDays.push(d); render(); }
+function genToggleTime(t){ haptic(); if (genTimes[t]) delete genTimes[t]; else genTimes[t]=1; render(); }
+function admSlotsGen(){
+  if (!genDays.length) { toast('Выбери дни недели 🙈'); return; }
+  var times = Object.keys(genTimes);
+  if (!times.length) { toast('Выбери время 🙈'); return; }
+  haptic('medium');
+  apiPost('/api/admin/slots/gen', { days: genDays, times: times }).then(function(d){
+    if (d.ok) { toast('⚡ Создано окошек: '+d.added); genTimes = {}; refreshAdmin(); refreshData(false); go('adm_sl'); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+
+function viewAdminRv(){
+  var s = admHead('Отзывы');
+  if (!AD.reviews || !AD.reviews.length) s += '<div class="empty">Отзывов пока нет 🤍</div>';
+  for (var i=0;i<(AD.reviews||[]).length;i++){
+    var r = AD.reviews[i];
+    s += '<div class="rev"'+(r.visible?'':' style="opacity:.45"')+'>';
+    s += '<div class="rh"><span class="rn">'+h(r.name)+(r.username?' <a style="color:var(--accent)" href="https://t.me/'+h(r.username)+'" target="_blank" rel="noopener">@'+h(r.username)+'</a>':'')+'</span><span class="rs">'+starsStr(r.rating)+'</span></div>';
+    if (r.text) s += '<div class="rt">'+h(r.text)+'</div>';
+    s += '<div style="display:flex;gap:8px;margin-top:10px">';
+    s += '<button class="abtn" style="flex:1;padding:9px 0;font-size:13px" onclick="admReview('+r.id+',\''+(r.visible?'hide':'show')+'\')">'+(r.visible?'🙈 Скрыть':'👁 Показать')+'</button>';
+    s += '<button class="abtn no" style="flex:1;padding:9px 0;font-size:13px" onclick="admReview('+r.id+',\'del\')">🗑</button>';
+    s += '</div></div>';
+  }
+  return s;
+}
+function admReview(id, action){
+  if (action==='del' && !confirm('Удалить отзыв навсегда?')) return;
+  haptic();
+  apiPost('/api/admin/review', { id:id, action:action }).then(function(d){
+    if (d.ok) { toast(action==='del'?'🗑 Удалён':'Готово ✨'); refreshAdmin(); }
     else toast(d.error || 'Ошибка 😔');
   });
 }
@@ -2309,6 +2574,17 @@ export default {
       });
     }
 
+    // Фото работ (прокси к файлам Telegram)
+    if (url.pathname.startsWith("/photo/")) {
+      const fid = url.pathname.slice("/photo/".length);
+      const f = await tg(env, "getFile", { file_id: fid });
+      if (!f.ok) return new Response("not found", { status: 404 });
+      const fr = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${f.result.file_path}`);
+      return new Response(fr.body, {
+        headers: { "content-type": fr.headers.get("content-type") || "image/jpeg", "cache-control": "public, max-age=86400" },
+      });
+    }
+
     // API мини-аппа
     if (url.pathname.startsWith("/api/")) {
       const initData = request.headers.get("X-Tg-Init-Data") || "";
@@ -2324,6 +2600,8 @@ export default {
         return apiBook(env, user, await request.json().catch(() => ({})));
       if (url.pathname === "/api/cancel" && request.method === "POST")
         return apiCancel(env, user, await request.json().catch(() => ({})));
+      if (url.pathname === "/api/review" && request.method === "POST")
+        return apiReview(env, user, await request.json().catch(() => ({})));
       return json({ ok: false, error: "not_found" }, 404);
     }
 
@@ -2345,6 +2623,34 @@ export default {
 
     // Настройка вебхука и кнопки меню (открыть один раз после деплоя)
     if (url.pathname === `/setup/${env.WEBHOOK_SECRET}`) {
+      // Миграции БД — безопасно запускать повторно
+      const MIGRATIONS = [
+        `CREATE TABLE IF NOT EXISTS reviews (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          booking_id INTEGER,
+          name TEXT NOT NULL DEFAULT '',
+          username TEXT NOT NULL DEFAULT '',
+          rating INTEGER NOT NULL,
+          text TEXT NOT NULL DEFAULT '',
+          visible INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE TABLE IF NOT EXISTS service_photos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          service_id INTEGER NOT NULL,
+          file_id TEXT NOT NULL,
+          sort INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        "ALTER TABLE bookings ADD COLUMN review_asked INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE bookings ADD COLUMN reminded2 INTEGER NOT NULL DEFAULT 0",
+      ];
+      const mig = [];
+      for (const sql of MIGRATIONS) {
+        try { await env.DB.prepare(sql).run(); mig.push("ok"); } catch (e) { mig.push(String(e).slice(0, 60)); }
+      }
+      await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('app_url', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(origin).run();
       const wh = await tg(env, "setWebhook", {
         url: `${origin}/webhook/${env.WEBHOOK_SECRET}`,
         drop_pending_updates: true,
@@ -2353,7 +2659,7 @@ export default {
       const mb = await tg(env, "setChatMenuButton", {
         menu_button: { type: "web_app", text: "✨ Записаться", web_app: { url: `${origin}/app` } },
       });
-      return json({ webhook: wh, menu_button: mb });
+      return json({ webhook: wh, menu_button: mb, migrations: mig });
     }
 
     // Статус-страница
@@ -2364,18 +2670,58 @@ export default {
     );
   },
 
-  // Напоминания о завтрашних записях (cron из wrangler.toml)
+  // Напоминания и сбор отзывов (cron каждые 15 минут)
   async scheduled(event, env, ctx) {
     ctx.waitUntil((async () => {
-      const tomorrow = addDays(todayStr(env), 1);
-      const { results } = await env.DB.prepare(
-        "SELECT * FROM bookings WHERE date=? AND status='confirmed' AND reminded=0"
-      ).bind(tomorrow).all();
-      for (const b of results || []) {
-        const r = await send(env, b.user_id,
-          `💌 <b>Напоминание о записи</b>\n\nЗавтра, <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)}\n\nЖду тебя, красотка! 🤍`);
-        if (r.ok) await env.DB.prepare("UPDATE bookings SET reminded=1 WHERE id=?").bind(b.id).run();
+      const today = todayStr(env);
+      const tomorrow = addDays(today, 1);
+      const nowL = nowLocal(env);
+      const nowU = Date.UTC(nowL.getUTCFullYear(), nowL.getUTCMonth(), nowL.getUTCDate(), nowL.getUTCHours(), nowL.getUTCMinutes());
+
+      // 1) Напоминание накануне — один раз в день (12:00 UTC = 19:00 Нск)
+      if (nowL.getUTCHours() === 12 && nowL.getUTCMinutes() < 15) {
+        const rows = await dbAll(env, "SELECT * FROM bookings WHERE date=? AND status='confirmed' AND reminded=0", tomorrow);
+        for (const b of rows) {
+          const r = await send(env, b.user_id,
+            `💌 <b>Напоминание о записи</b>\n\nЗавтра, <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)}\n\nЖду тебя, красотка! 🤍`);
+          if (r.ok) await env.DB.prepare("UPDATE bookings SET reminded=1 WHERE id=?").bind(b.id).run();
+        }
       }
+
+      // 2) Напоминание за 2 часа до визита
+      try {
+        const soon = await dbAll(env,
+          "SELECT * FROM bookings WHERE date IN (?,?) AND status='confirmed' AND reminded2=0", today, tomorrow);
+        for (const b of soon) {
+          const [y, m, d] = b.date.split("-").map(Number);
+          const [hh, mm] = b.time.split(":").map(Number);
+          const diff = (Date.UTC(y, m - 1, d, hh, mm) - nowU) / 60000;
+          if (diff >= 100 && diff <= 135) {
+            const r = await send(env, b.user_id,
+              `⏰ <b>Через 2 часа жду тебя!</b>\n\n💅 ${html(b.service_name)} · сегодня в <b>${b.time}</b>\n📍 г. Бердск, ул. Вокзальная, 2\n\nДо встречи 🤍`);
+            if (r.ok) await env.DB.prepare("UPDATE bookings SET reminded2=1 WHERE id=?").bind(b.id).run();
+          }
+        }
+      } catch (e) { console.log("remind2", String(e)); }
+
+      // 3) Просим отзыв через ~2 часа после визита
+      try {
+        const appUrl = await getSetting(env, "app_url");
+        const yesterday = addDays(today, -1);
+        const done = await dbAll(env,
+          "SELECT * FROM bookings WHERE date IN (?,?) AND status='confirmed' AND review_asked=0", yesterday, today);
+        for (const b of done) {
+          const [y, m, d] = b.date.split("-").map(Number);
+          const [hh, mm] = b.time.split(":").map(Number);
+          const endU = Date.UTC(y, m - 1, d, hh, mm) + 120 * 60000;
+          if (endU <= nowU) {
+            const extra = appUrl ? { reply_markup: kb([[webBtn("⭐ Оставить отзыв", appUrl + "/app")]]) } : {};
+            const r = await send(env, b.user_id,
+              `💅 <b>Как тебе ноготки?</b>\n\nПара секунд — оцени визит, мне будет очень приятно 🤍`, extra);
+            if (r.ok) await env.DB.prepare("UPDATE bookings SET review_asked=1 WHERE id=?").bind(b.id).run();
+          }
+        }
+      } catch (e) { console.log("review ask", String(e)); }
     })());
   },
 };

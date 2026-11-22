@@ -77,3 +77,23 @@ SELECT * FROM (
   UNION ALL SELECT 'Снятие чужой работы',   'Бережное снятие без спила своего ногтя', 300, 30, 5
   UNION ALL SELECT 'Дизайн',                'От 50₽ за ноготь: френч, стемпинг, блёстки, стразы', 50, 15, 6
 ) WHERE NOT EXISTS (SELECT 1 FROM services);
+CREATE TABLE IF NOT EXISTS reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  booking_id INTEGER,
+  name TEXT NOT NULL DEFAULT '',
+  username TEXT NOT NULL DEFAULT '',
+  rating INTEGER NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  visible INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS service_photos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  service_id INTEGER NOT NULL,
+  file_id TEXT NOT NULL,
+  sort INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+ALTER TABLE bookings ADD COLUMN review_asked INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE bookings ADD COLUMN reminded2 INTEGER NOT NULL DEFAULT 0;

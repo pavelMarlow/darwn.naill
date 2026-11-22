@@ -22,7 +22,7 @@ database_id = "ad681244-09b6-400b-8a7b-8b3e71cdd561"   # ← ВПИШИ Database
 
 # Напоминания клиентам накануне записи (12:00 UTC = 19:00 Новосибирск)
 [triggers]
-crons = ["0 12 * * *"]
+crons = ["*/15 * * * *"]
 
 # ⚠️ BOT_TOKEN сюда НЕ пишем! Он задаётся как Secret:
 # Workers & Pages → darwn-naill-bot → Settings → Variables and Secrets → Add → тип Secret
