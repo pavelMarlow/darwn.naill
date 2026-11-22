@@ -917,8 +917,8 @@ async function apiBook(env, user, body) {
   const { slot_id, service_id, name, phone } = body || {};
   if (!slot_id || !service_id || !name || String(name).trim().length < 2)
     return json({ ok: false, error: "Заполни имя и выбери время 🙈" }, 400);
-  if (phone && !/^[+]?[\d\s\-()]{10,18}$/.test(String(phone).trim()))
-    return json({ ok: false, error: "Похоже, в телефоне опечатка 🙈" }, 400);
+  if (!phone || !/^[+]?[\d\s\-()]{10,18}$/.test(String(phone).trim()))
+    return json({ ok: false, error: "Оставь номер телефона 🙈" }, 400);
   const res = await createBooking(env, {
     userId: user.id, slotId: +slot_id, serviceId: +service_id,
     name: String(name).trim().slice(0, 40), phone: phone ? String(phone).trim() : "", source: "app",
@@ -951,7 +951,7 @@ async function apiAdmin(env, path, body) {
       "SELECT * FROM bookings WHERE status IN ('pending','confirmed') AND date>=? ORDER BY date, time LIMIT 100"
     ).bind(today).all()).results || [];
     const slots = (await env.DB.prepare(
-      `SELECT s.*, b.client_name, b.client_username FROM slots s
+      `SELECT s.*, b.client_name, b.client_username, b.client_phone FROM slots s
        LEFT JOIN bookings b ON b.id = s.booking_id WHERE s.date>=? ORDER BY s.date, s.time LIMIT 400`
     ).bind(today).all()).results || [];
     const services = (await env.DB.prepare("SELECT * FROM services ORDER BY sort, id").all()).results || [];
@@ -1346,7 +1346,6 @@ function viewHome(){
     s += '<div><div class="nm">'+h(sv.name)+'</div>';
     if (sv.description) s += '<div class="ds">'+h(sv.description)+'</div>';
     s += '<div class="dur">⏱ ~'+durLabel(sv.duration_min)+'</div></div>';
-    if (sv.photos && sv.photos.length) s += '<div class="gal">'+sv.photos.map(function(p){ return '<img loading="lazy" src="/photo/'+encodeURIComponent(p)+'" onclick="event.stopPropagation();photoView(this.src)">'; }).join('')+'</div>';
     s += '<div class="pr"><b>'+sv.price+'₽</b><br><span class="go">Записаться</span></div>';
     s += '</div>';
   }
@@ -1473,7 +1472,7 @@ function viewBook(){
   if (sel.slotId) {
     s += '<div class="sect">Как к тебе обращаться?</div>';
     s += '<input class="inp" id="inName" placeholder="Имя" value="'+h(form.name)+'" oninput="form.name=this.value;updCta()">';
-    s += '<input class="inp" id="inPhone" placeholder="Телефон (необязательно)" value="'+h(form.phone)+'" oninput="form.phone=this.value">';
+    s += '<input class="inp" id="inPhone" placeholder="Телефон*" value="'+h(form.phone)+'" oninput="form.phone=this.value;updCta()">';
   }
   s += '<div style="height:76px"></div>';
   return s;
@@ -1498,9 +1497,10 @@ function renderCta(){
     updCta();
   } else c.innerHTML = '';
 }
+function validPhone(p){ return /^[+]?[\d\s\-()]{10,18}$/.test(String(p||'').trim()); }
 function updCta(){
   var b = $('ctaBtn');
-  if (b) b.disabled = sending || form.name.trim().length < 2;
+  if (b) b.disabled = sending || form.name.trim().length < 2 || !validPhone(form.phone);
 }
 function go(v){ haptic(); view=v; render(); }
 function openSvc(id){
@@ -1515,6 +1515,7 @@ function pickSlot(id, t){ haptic('medium'); sel.slotId=id; sel.time=t; render();
 function submitBook(){
   if (sending) return;
   if (form.name.trim().length < 2) { toast('Напиши имя 🙈'); return; }
+  if (!validPhone(form.phone)) { toast('Оставь номер телефона 🙈'); return; }
   sending = true; updCta();
   haptic('heavy');
   var headers = { 'content-type':'application/json' };
@@ -1629,7 +1630,7 @@ function viewAdminSl(){
       if (sl2.status==='free') {
         s += '<div class="tchip" onclick="admSlotDel('+sl2.id+',\''+sl2.time+'\')">🟢 '+sl2.time+'</div>';
       } else {
-        var info = sl2.time+' · '+(sl2.client_name||'занято')+(sl2.client_username?' @'+sl2.client_username:'');
+        var info = sl2.time+' · '+(sl2.client_name||'занято')+(sl2.client_username?' @'+sl2.client_username:'')+(sl2.client_phone?' · '+sl2.client_phone:'');
         s += '<div class="tchip busy" data-info="'+h(info)+'" onclick="toast(this.getAttribute(\'data-info\'))">🔴 '+sl2.time+'</div>';
       }
     }
