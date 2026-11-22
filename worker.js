@@ -1090,6 +1090,7 @@ const MINI_APP_HTML = String.raw`<!DOCTYPE html>
   .abtn:disabled { opacity:.5; }
   .tchip.busy { opacity:.45; }
   .chkrow { display:flex; gap:8px; align-items:center; margin-top:12px; color:var(--muted); font-size:14px; }
+  .chkrow input { accent-color:var(--accent2); width:17px; height:17px; }
   textarea.inp { resize:vertical; font-family:inherit; }
   .toast {
     position:fixed; top:14px; left:50%; transform:translateX(-50%); background:#2a1a22; border:1px solid var(--card-border);
