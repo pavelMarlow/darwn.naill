@@ -8,7 +8,7 @@ compatibility_date = "2024-11-11"
 
 [vars]
 # Твой Telegram ID (узнать: @userinfobot)
-ADMIN_ID = "000000000"          # ← ВПИШИ свой ID вместо нулей
+ADMIN_ID = "5932180739"          # ← ВПИШИ свой ID вместо нулей
 # Любая случайная строка — защита вебхука (придумай сама)
 WEBHOOK_SECRET = "change-me"    # ← ВПИШИ случайную строку
 # Часовой пояс (Новосибирск = 7)
@@ -18,7 +18,7 @@ TZ_OFFSET_HOURS = "7"
 [[d1_databases]]
 binding = "DB"
 database_name = "darwn_naill_db"
-database_id = "00000000-0000-0000-0000-000000000000"   # ← ВПИШИ Database ID со страницы базы
+database_id = "ad681244-09b6-400b-8a7b-8b3e71cdd561"   # ← ВПИШИ Database ID со страницы базы
 
 # Напоминания клиентам накануне записи (12:00 UTC = 19:00 Новосибирск)
 [triggers]
