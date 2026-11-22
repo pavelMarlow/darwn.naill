@@ -1,0 +1,24 @@
+# ═══════════════════════════════════════════
+#  💅 DARWN.NAILL — Cloudflare Worker
+# ═══════════════════════════════════════════
+name = "darwn-naill-bot"
+main = "worker.js"
+compatibility_date = "2024-11-11"
+
+[vars]
+# Твой Telegram ID (узнать: @userinfobot). Несколько — через запятую: "111,222"
+ADMIN_ID = "ВСТАВЬ_СВОЙ_TELEGRAM_ID"
+# Любая случайная строка — защита вебхука. Придумай сама, например: x9k2m4nails
+WEBHOOK_SECRET = "ПРИДУМАЙ_СЛУЧАЙНУЮ_СТРОКУ"
+# Часовой пояс (Новосибирск = 7)
+TZ_OFFSET_HOURS = "7"
+
+# База D1: после `wrangler d1 create darwn_naill_db` вставь сюда database_id
+[[d1_databases]]
+binding = "DB"
+database_name = "darwn_naill_db"
+database_id = "ВСТАВЬ_DATABASE_ID"
+
+# Напоминания клиентам накануне записи (каждый день 12:00 UTC = 19:00 Новосибирск)
+[triggers]
+crons = ["0 12 * * *"]
