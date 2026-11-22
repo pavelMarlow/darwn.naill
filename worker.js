@@ -29,7 +29,8 @@ const DEFAULT_TEXTS = {
     "<i>Делаю ногти, с которыми хочется жить 💅</i>",
   contacts_text:
     "📍 <b>Контакты</b>\n\n" +
-    "Точный адрес отправлю после подтверждения записи 💌\n" +
+    "🏠 г. Бердск, ул. Вокзальная, 2\n" +
+    "Как пройти — подскажу после записи 💌\n\n" +
     "По любым вопросам — жми кнопку ниже, я на связи:",
   promo_text: "",
   portfolio_url: "",
@@ -651,7 +652,7 @@ async function onCallback(env, cb, appUrl) {
       await env.DB.prepare("UPDATE bookings SET status='confirmed' WHERE id=?").bind(id).run();
       await answer(env, cb.id, "✅ Подтверждено");
       await send(env, b.user_id,
-        `✅ <b>Запись подтверждена!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\nЖду тебя, красотка 🤍\n<i>Адрес отправлю отдельным сообщением 💌</i>`,
+        `✅ <b>Запись подтверждена!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\nЖду тебя, красотка 🤍\n📍 <i>г. Бердск, ул. Вокзальная, 2 💌</i>`,
         { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))]]) });
     } else {
       await cancelBooking(env, id, true);
@@ -827,6 +828,7 @@ async function apiData(env, user) {
     user: { id: user.id, first_name: user.first_name, username: user.username, phone: (u && u.phone) || "" },
     services, slots, bookings,
     texts: { about: texts.about_text, contacts: texts.contacts_text, promo: texts.promo_text, portfolio_url: texts.portfolio_url, master_link: texts.master_link },
+    is_admin: isAdmin(env, user.id),
   });
 }
 
@@ -857,6 +859,104 @@ async function apiCancel(env, user, body) {
   for (const id of ids)
     await send(env, id, `⚠️ <b>Клиент отменил запись</b>\n\n👤 ${html(b.client_name)} (${mention(b.client_username)})\n🗓 ${dateLabel(b.date)} в ${b.time}\n💅 ${html(b.service_name)}`);
   return json({ ok: true });
+}
+
+
+// ────────────────────────── MINI APP: АДМИН-API ──────────────────────────
+async function apiAdmin(env, path, body) {
+  const today = todayStr(env);
+  if (path === "/api/admin/data") {
+    const bookings = (await env.DB.prepare(
+      "SELECT * FROM bookings WHERE status IN ('pending','confirmed') AND date>=? ORDER BY date, time LIMIT 100"
+    ).bind(today).all()).results || [];
+    const slots = (await env.DB.prepare(
+      `SELECT s.*, b.client_name, b.client_username FROM slots s
+       LEFT JOIN bookings b ON b.id = s.booking_id WHERE s.date>=? ORDER BY s.date, s.time LIMIT 400`
+    ).bind(today).all()).results || [];
+    const services = (await env.DB.prepare("SELECT * FROM services ORDER BY sort, id").all()).results || [];
+    const texts = await getTexts(env);
+    const one = async (q, ...b) => (await env.DB.prepare(q).bind(...b).first()).n;
+    return json({ ok: true, today, bookings, slots, services, texts, stats: {
+      users: await one("SELECT COUNT(*) n FROM users"),
+      upcoming: await one("SELECT COUNT(*) n FROM bookings WHERE status IN ('pending','confirmed') AND date>=?", today),
+      pending: await one("SELECT COUNT(*) n FROM bookings WHERE status='pending' AND date>=?", today),
+      free_slots: await one("SELECT COUNT(*) n FROM slots WHERE status='free' AND date>=?", today),
+      revenue: await one("SELECT COALESCE(SUM(price),0) n FROM bookings WHERE status='confirmed' AND date>=?", today),
+    }});
+  }
+  if (path === "/api/admin/booking") {
+    const b = await env.DB.prepare("SELECT * FROM bookings WHERE id=?").bind(+body.id).first();
+    if (!b) return json({ ok: false, error: "not_found" }, 404);
+    if (body.action === "confirm" && b.status === "pending") {
+      await env.DB.prepare("UPDATE bookings SET status='confirmed' WHERE id=?").bind(b.id).run();
+      await send(env, b.user_id,
+        `✅ <b>Запись подтверждена!</b>\n\n🗓 <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n💅 ${html(b.service_name)} · ${b.price}₽\n\nЖду тебя, красотка 🤍\n📍 <i>г. Бердск, ул. Вокзальная, 2 💌</i>`,
+        { reply_markup: kb([[urlBtn("📆 Добавить в календарь", gcalLink(env, b))]]) });
+    } else {
+      await cancelBooking(env, b.id, true);
+      await send(env, b.user_id,
+        `😔 <b>Запись отменена</b>\n\n🗓 ${dateLabel(b.date)} в ${b.time}\n💅 ${html(b.service_name)}\n\nЕсли это ошибка — напиши мне или запишись заново 🤍`);
+    }
+    return json({ ok: true });
+  }
+  if (path === "/api/admin/slot/add") {
+    const date = String(body.date || "");
+    const m = String(body.time || "").trim().match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !m) return json({ ok: false, error: "Проверь дату и время 🙈" }, 400);
+    await env.DB.prepare("INSERT OR IGNORE INTO slots (date, time) VALUES (?,?)").bind(date, `${pad2(m[1])}:${m[2]}`).run();
+    return json({ ok: true });
+  }
+  if (path === "/api/admin/slot/del") {
+    const s = await env.DB.prepare("SELECT * FROM slots WHERE id=?").bind(+body.id).first();
+    if (!s) return json({ ok: false, error: "not_found" }, 404);
+    if (s.status !== "free") return json({ ok: false, error: "slot_busy" }, 409);
+    await env.DB.prepare("DELETE FROM slots WHERE id=?").bind(s.id).run();
+    return json({ ok: true });
+  }
+  if (path === "/api/admin/slots/clear") {
+    const r = await env.DB.prepare("DELETE FROM slots WHERE status='free' AND date>=?").bind(today).run();
+    return json({ ok: true, deleted: r.meta.changes || 0 });
+  }
+  if (path === "/api/admin/service/save") {
+    const name = String(body.name || "").trim().slice(0, 60);
+    const price = parseInt(String(body.price).replace(/\D/g, ""), 10) || 0;
+    const dur = parseInt(String(body.duration_min).replace(/\D/g, ""), 10) || 60;
+    const desc = String(body.description || "").trim().slice(0, 300);
+    const active = body.active ? 1 : 0;
+    if (!name || !price) return json({ ok: false, error: "Заполни название и цену 🙈" }, 400);
+    if (body.id) {
+      await env.DB.prepare("UPDATE services SET name=?, description=?, price=?, duration_min=?, active=? WHERE id=?")
+        .bind(name, desc, price, dur, active, +body.id).run();
+      return json({ ok: true });
+    }
+    await env.DB.prepare("INSERT INTO services (name, description, price, duration_min, active) VALUES (?,?,?,?,?)")
+      .bind(name, desc, price, dur, active).run();
+    return json({ ok: true });
+  }
+  if (path === "/api/admin/service/del") {
+    await env.DB.prepare("DELETE FROM services WHERE id=?").bind(+body.id).run();
+    return json({ ok: true });
+  }
+  if (path === "/api/admin/text") {
+    const keys = ["start_text", "about_text", "contacts_text", "promo_text", "portfolio_url", "master_link"];
+    if (!keys.includes(body.key)) return json({ ok: false, error: "bad_key" }, 400);
+    await env.DB.prepare("INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+      .bind(body.key, String(body.value || "")).run();
+    return json({ ok: true });
+  }
+  if (path === "/api/admin/broadcast") {
+    const text = String(body.text || "").trim();
+    if (!text) return json({ ok: false, error: "Пустое сообщение 🙈" }, 400);
+    const { results } = await env.DB.prepare("SELECT telegram_id FROM users WHERE blocked=0").all();
+    let ok = 0, fail = 0;
+    for (const u of results || []) {
+      const r = await tg(env, "sendMessage", { chat_id: u.telegram_id, text, parse_mode: "HTML", disable_web_page_preview: true });
+      if (r.ok) ok++;
+      else { fail++; if (r.error_code === 403) await env.DB.prepare("UPDATE users SET blocked=1 WHERE telegram_id=?").bind(u.telegram_id).run(); }
+    }
+    return json({ ok: true, delivered: ok, failed: fail });
+  }
+  return json({ ok: false, error: "not_found" }, 404);
 }
 
 // ────────────────────────── MINI APP: HTML ──────────────────────────
@@ -977,6 +1077,20 @@ const MINI_APP_HTML = String.raw`<!DOCTYPE html>
   .skel { height:74px; border-radius:20px; margin-top:12px; background:linear-gradient(90deg, rgba(255,255,255,.04), rgba(255,255,255,.09), rgba(255,255,255,.04)); background-size:200% 100%; animation:sk 1.2s infinite; }
   @keyframes sk { to { background-position:-200% 0; } }
   .err { text-align:center; padding:60px 20px; color:var(--muted); }
+  .statgrid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:16px; }
+  .stat { background:var(--card); border:1px solid var(--card-border); border-radius:16px; padding:14px 8px; text-align:center; }
+  .stat b { font-size:20px; display:block; background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .stat span { font-size:11px; color:var(--muted); }
+  .menurow { display:flex; justify-content:space-between; align-items:center; font-weight:600; font-size:15px; cursor:pointer; }
+  .menurow:active { transform:scale(.98); }
+  .badge { background:var(--grad); color:#2a1410; font-size:12px; font-weight:800; border-radius:20px; padding:3px 10px; }
+  .abtn { padding:11px 14px; border-radius:13px; border:1px solid var(--card-border); background:var(--card); color:var(--text); font-size:13.5px; font-weight:700; cursor:pointer; }
+  .abtn.ok { background:var(--grad); color:#2a1410; border-color:transparent; }
+  .abtn.no { color:var(--red); border-color:rgba(255,143,163,.4); background:rgba(255,143,163,.06); }
+  .abtn:disabled { opacity:.5; }
+  .tchip.busy { opacity:.45; }
+  .chkrow { display:flex; gap:8px; align-items:center; margin-top:12px; color:var(--muted); font-size:14px; }
+  textarea.inp { resize:vertical; font-family:inherit; }
   .toast {
     position:fixed; top:14px; left:50%; transform:translateX(-50%); background:#2a1a22; border:1px solid var(--card-border);
     color:var(--text); padding:11px 18px; border-radius:14px; font-size:13.5px; z-index:50; box-shadow:0 10px 30px rgba(0,0,0,.5); animation:fade .25s;
@@ -998,6 +1112,33 @@ var view = 'home';     // home | book | done | my | contacts
 var sel = { svc:null, date:null, slotId:null, time:null };
 var form = { name:'', phone:'' };
 var sending = false;
+var AD = null;          // данные админки
+var admSlotDate = null; // выбранная дата в добавлении окошка
+var editSvc = null;     // редактируемая услуга
+var editTextKey = null; // редактируемый текст
+var API_URL = '__API__';
+
+function apiPost(path, body){
+  return fetch(API_URL+path, { method:'POST', headers:{ 'content-type':'application/json', 'X-Tg-Init-Data': tg.initData }, body: JSON.stringify(body||{}) })
+    .then(function(r){ return r.json(); })
+    .catch(function(){ return { ok:false, error:'Нет связи 😔' }; });
+}
+function loadAdmin(cb){
+  fetch(API_URL+'/api/admin/data', { headers:{ 'X-Tg-Init-Data': tg.initData } })
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if (d.ok){ AD=d; if(cb)cb(); } else toast(d.error==='forbidden'?'Это только для мастера 🙈':'Ошибка загрузки 😔'); })
+    .catch(function(){ toast('Нет связи 😔'); });
+}
+function refreshAdmin(){ loadAdmin(function(){ render(); }); }
+function goAdmin(){ haptic(); if (!AD){ loadAdmin(function(){ view='adm'; render(); }); } else { view='adm'; render(); } }
+function tabsHtml(active){
+  var s = '<div class="tabs">';
+  s += '<div class="tab'+(active==='home'?' active':'')+'" onclick="go(\'home\')">💅 Услуги</div>';
+  s += '<div class="tab'+(active==='my'?' active':'')+'" onclick="go(\'my\')">📅 Записи</div>';
+  s += '<div class="tab'+(active==='contacts'?' active':'')+'" onclick="go(\'contacts\')">📍 Инфо</div>';
+  if (D.is_admin) s += '<div class="tab'+(active==='adm'?' active':'')+'" onclick="goAdmin()">👑</div>';
+  return s + '</div>';
+}
 
 function h(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
 function $(id){ return document.getElementById(id); }
@@ -1039,6 +1180,15 @@ function render(){
   else if (view==='done') html = viewDone();
   else if (view==='my') html = viewMy();
   else if (view==='contacts') html = viewContacts();
+  else if (view==='adm') html = viewAdmin();
+  else if (view==='adm_bk') html = viewAdminBk();
+  else if (view==='adm_sl') html = viewAdminSl();
+  else if (view==='adm_sl_add') html = viewAdminSlAdd();
+  else if (view==='adm_sv') html = viewAdminSv();
+  else if (view==='adm_sv_edit') html = viewAdminSvEdit();
+  else if (view==='adm_tx') html = viewAdminTx();
+  else if (view==='adm_tx_edit') html = viewAdminTxEdit();
+  else if (view==='adm_bc') html = viewAdminBc();
   $('app').innerHTML = '<div class="fade">'+html+'</div>';
   renderCta();
 }
@@ -1048,11 +1198,7 @@ function viewHome(){
   var s = '';
   s += '<div class="logo"><div class="ring">💅</div><h1>DARWN.NAILL</h1><p>Дарина · мастер маникюра · стаж 3 года</p></div>';
   if (t.promo) s += '<div class="card promo"><div class="tag">🔥 АКЦИЯ</div><div class="txt">'+nl2br(stripTags(t.promo))+'</div></div>';
-  s += '<div class="tabs">';
-  s += '<div class="tab active" onclick="go(\'home\')">💅 Услуги</div>';
-  s += '<div class="tab" onclick="go(\'my\')">📅 Записи</div>';
-  s += '<div class="tab" onclick="go(\'contacts\')">📍 Инфо</div>';
-  s += '</div>';
+  s += tabsHtml('home');
   s += '<div class="sect">Выбери услугу</div>';
   if (!D.services.length) s += '<div class="empty">Скоро здесь появятся услуги 🤍</div>';
   for (var i=0;i<D.services.length;i++){
@@ -1070,11 +1216,7 @@ function viewHome(){
 function viewMy(){
   var s = '';
   s += '<div class="logo"><div class="ring">📅</div><h1>МОИ ЗАПИСИ</h1></div>';
-  s += '<div class="tabs">';
-  s += '<div class="tab" onclick="go(\'home\')">💅 Услуги</div>';
-  s += '<div class="tab active" onclick="go(\'my\')">📅 Записи</div>';
-  s += '<div class="tab" onclick="go(\'contacts\')">📍 Инфо</div>';
-  s += '</div>';
+  s += tabsHtml('my');
   if (!D.bookings.length) s += '<div class="empty">У тебя пока нет активных записей 🤍<br>Выбери услугу и запишись!</div>';
   for (var i=0;i<D.bookings.length;i++){
     var b = D.bookings[i]; var f = fmtDateLabel(b.date);
@@ -1089,11 +1231,7 @@ function viewContacts(){
   var t = D.texts;
   var s = '';
   s += '<div class="logo"><div class="ring">🤍</div><h1>ИНФО</h1></div>';
-  s += '<div class="tabs">';
-  s += '<div class="tab" onclick="go(\'home\')">💅 Услуги</div>';
-  s += '<div class="tab" onclick="go(\'my\')">📅 Записи</div>';
-  s += '<div class="tab active" onclick="go(\'contacts\')">📍 Инфо</div>';
-  s += '</div>';
+  s += tabsHtml('contacts');
   s += '<div class="card"><div style="font-size:14px;line-height:1.65">'+nl2br(stripTags(t.about))+'</div></div>';
   s += '<div class="card"><div style="font-size:14px;line-height:1.65">'+nl2br(stripTags(t.contacts))+'</div></div>';
   if (t.master_link) s += '<a class="linkbtn" href="'+h(t.master_link)+'">💬 Написать Дарине</a>';
@@ -1214,6 +1352,225 @@ function refreshData(rerender){
   if (tg && tg.initData) headers['X-Tg-Init-Data'] = tg.initData;
   fetch('__API__/api/data', { headers:headers }).then(function(r){ return r.json(); }).then(function(d){
     if (d.ok) { D = d; if (rerender) render(); }
+  });
+}
+
+// ─────────── АДМИНКА (только для мастера) ───────────
+function admHead(title){
+  return '<span class="back" onclick="goAdmin()">← Админка</span><div class="sect" style="margin-top:6px">'+title+'</div>';
+}
+function viewAdmin(){
+  var st = AD.stats;
+  var s = '<span class="back" onclick="go(\'home\')">← В приложение</span>';
+  s += '<div class="logo"><div class="ring">👑</div><h1>АДМИНКА</h1><p>привет, босс 🤍</p></div>';
+  s += '<div class="statgrid">';
+  s += '<div class="stat"><b>'+st.upcoming+'</b><span>предстоящих</span></div>';
+  s += '<div class="stat"><b>'+st.pending+'</b><span>ждут ответа</span></div>';
+  s += '<div class="stat"><b>'+st.free_slots+'</b><span>окошек</span></div>';
+  s += '<div class="stat"><b>'+st.revenue+'₽</b><span>выручка</span></div>';
+  s += '</div>';
+  s += '<div class="card menurow" onclick="go(\'adm_bk\')">📋 Записи'+(st.pending?'<span class="badge">'+st.pending+'</span>':'<span style="color:var(--muted)">→</span>')+'</div>';
+  s += '<div class="card menurow" onclick="go(\'adm_sl\')">🗓 Окошки<span style="color:var(--muted)">→</span></div>';
+  s += '<div class="card menurow" onclick="go(\'adm_sv\')">💅 Услуги<span style="color:var(--muted)">→</span></div>';
+  s += '<div class="card menurow" onclick="go(\'adm_tx\')">✏️ Тексты<span style="color:var(--muted)">→</span></div>';
+  s += '<div class="card menurow" onclick="go(\'adm_bc\')">📣 Рассылка<span style="color:var(--muted)">→</span></div>';
+  return s;
+}
+
+function viewAdminBk(){
+  var s = admHead('Записи · '+AD.bookings.length);
+  if (!AD.bookings.length) s += '<div class="empty">Записей нет 🤍</div>';
+  for (var i=0;i<AD.bookings.length;i++){
+    var b = AD.bookings[i]; var f = fmtDateLabel(b.date);
+    var st = b.status==='confirmed' ? '<span class="st c">✅ подтверждена</span>' : '<span class="st p">⏳ ждёт</span>';
+    s += '<div class="card"><div class="bk"><div><b>'+f.dd+' '+f.mo+' · '+b.time+'</b></div>'+st+'</div>';
+    s += '<div style="color:var(--muted);font-size:13px;margin-top:6px">💅 '+h(b.service_name)+' · '+b.price+'₽</div>';
+    s += '<div style="color:var(--muted);font-size:13px;margin-top:3px">👤 '+h(b.client_name)+(b.client_username?' · @'+h(b.client_username):'')+(b.client_phone?' · '+h(b.client_phone):'')+'</div>';
+    s += '<div style="display:flex;gap:8px;margin-top:10px">';
+    if (b.status==='pending') s += '<button class="abtn ok" style="flex:1" onclick="admBk('+b.id+',\'confirm\')">✅ Подтвердить</button>';
+    s += '<button class="abtn no" style="flex:1" onclick="admBk('+b.id+',\'cancel\')">'+(b.status==='pending'?'❌ Отклонить':'❌ Отменить')+'</button>';
+    if (b.client_username) s += '<button class="abtn" onclick="window.open(\'https://t.me/'+h(b.client_username)+'\')">💬</button>';
+    s += '</div></div>';
+  }
+  return s;
+}
+function admBk(id, action){
+  haptic('medium');
+  apiPost('/api/admin/booking', { id:id, action:action }).then(function(d){
+    if (d.ok) { toast(action==='confirm'?'✅ Подтверждено':'❌ Отменено, окошко свободно'); refreshAdmin(); refreshData(false); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+
+function viewAdminSl(){
+  var s = admHead('Окошки');
+  s += '<div style="display:flex;gap:8px;margin-top:8px">';
+  s += '<button class="abtn ok" style="flex:1" onclick="go(\'adm_sl_add\')">➕ Добавить</button>';
+  s += '<button class="abtn no" style="flex:1" onclick="admSlotsClear()">🧨 Удалить все</button>';
+  s += '</div>';
+  if (!AD.slots.length) s += '<div class="empty">Окошек нет — добавь первое 👆</div>';
+  var byDate = {};
+  for (var i=0;i<AD.slots.length;i++){ var sl = AD.slots[i]; (byDate[sl.date]=byDate[sl.date]||[]).push(sl); }
+  var dates = Object.keys(byDate).sort();
+  for (var di=0;di<dates.length;di++){
+    var f = fmtDateLabel(dates[di]);
+    s += '<div class="sect">'+f.wd+', '+f.dd+' '+f.mo+'</div><div class="times">';
+    var arr = byDate[dates[di]];
+    for (var j=0;j<arr.length;j++){
+      var sl2 = arr[j];
+      if (sl2.status==='free') {
+        s += '<div class="tchip" onclick="admSlotDel('+sl2.id+',\''+sl2.time+'\')">🟢 '+sl2.time+'</div>';
+      } else {
+        var info = sl2.time+' · '+(sl2.client_name||'занято')+(sl2.client_username?' @'+sl2.client_username:'');
+        s += '<div class="tchip busy" data-info="'+h(info)+'" onclick="toast(this.getAttribute(\'data-info\'))">🔴 '+sl2.time+'</div>';
+      }
+    }
+    s += '</div>';
+  }
+  s += '<div style="color:var(--muted);font-size:12px;margin-top:10px;text-align:center">🟢 тап = удалить · 🔴 занято (тап = кто записан)</div>';
+  return s;
+}
+function admSlotDel(id, time){
+  if (!confirm('Удалить окошко '+time+'?')) return;
+  haptic('medium');
+  apiPost('/api/admin/slot/del', { id:id }).then(function(d){
+    if (d.ok) { toast('🗑 Окошко удалено'); refreshAdmin(); refreshData(false); }
+    else toast(d.error==='slot_busy'?'Нельзя удалить занятое окошко 🙈':(d.error||'Ошибка 😔'));
+  });
+}
+function admSlotsClear(){
+  if (!confirm('Удалить ВСЕ свободные окошки? Занятые не пострадают.')) return;
+  haptic('heavy');
+  apiPost('/api/admin/slots/clear', {}).then(function(d){
+    if (d.ok) { toast('🧨 Удалено окошек: '+d.deleted); refreshAdmin(); refreshData(false); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+function addDaysStr(ds, n){
+  var p = ds.split('-'); var dt = new Date(Date.UTC(+p[0], +p[1]-1, +p[2]+n));
+  var mm = dt.getUTCMonth()+1, dd = dt.getUTCDate();
+  return dt.getUTCFullYear()+'-'+(mm<10?'0':'')+mm+'-'+(dd<10?'0':'')+dd;
+}
+function viewAdminSlAdd(){
+  var s = admHead('Добавить окошко');
+  s += '<div class="sect">Дата</div><div class="dates">';
+  for (var i=0;i<14;i++){
+    var d = addDaysStr(AD.today, i); var f = fmtDateLabel(d);
+    s += '<div class="dchip'+(admSlotDate===d?' active':'')+'" onclick="admSlotDate=\''+d+'\';render();"><div class="wd">'+f.wd+'</div><div class="dd">'+f.dd+'</div><div class="wd">'+f.mo+'</div></div>';
+  }
+  s += '</div>';
+  if (admSlotDate) {
+    s += '<div class="sect">Время (можно несколько подряд)</div><div class="times">';
+    var presets = ['09:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00','20:00'];
+    for (var j=0;j<presets.length;j++) s += '<div class="tchip" onclick="admSlotAdd(\''+presets[j]+'\')">'+presets[j]+'</div>';
+    s += '</div>';
+    s += '<input class="inp" id="admTime" placeholder="Своё время, напр. 14:30">';
+    s += '<button class="abtn ok" style="width:100%;margin-top:10px" onclick="admSlotAdd($(\'admTime\').value)">➕ Добавить своё время</button>';
+  }
+  return s;
+}
+function admSlotAdd(time){
+  time = String(time||'').trim();
+  if (!/^\d{1,2}:\d{2}$/.test(time)) { toast('Формат времени ЧЧ:ММ 🙈'); return; }
+  haptic('medium');
+  apiPost('/api/admin/slot/add', { date:admSlotDate, time:time }).then(function(d){
+    if (d.ok) { toast('✅ Окошко '+time+' добавлено'); refreshAdmin(); refreshData(false); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+
+function viewAdminSv(){
+  var s = admHead('Услуги');
+  s += '<button class="abtn ok" style="width:100%;margin:10px 0 2px" onclick="editSvc=null;go(\'adm_sv_edit\')">➕ Добавить услугу</button>';
+  if (!AD.services.length) s += '<div class="empty">Пусто 🤍</div>';
+  for (var i=0;i<AD.services.length;i++){
+    var sv = AD.services[i];
+    s += '<div class="card svc" onclick="admSvEdit('+sv.id+')"><div><div class="nm">'+h(sv.name)+(sv.active?'':' 💤')+'</div><div class="dur">⏱ '+sv.duration_min+' мин</div></div><div class="pr"><b>'+sv.price+'₽</b><br><span class="go">Править</span></div></div>';
+  }
+  return s;
+}
+function admSvEdit(id){
+  for (var i=0;i<AD.services.length;i++) if (AD.services[i].id===id) editSvc = AD.services[i];
+  go('adm_sv_edit');
+}
+function gv(id){ var e = $(id); return e ? e.value.trim() : ''; }
+function viewAdminSvEdit(){
+  var e = editSvc || { name:'', price:'', duration_min:120, description:'', active:1 };
+  var s = admHead(editSvc ? 'Редактировать услугу' : 'Новая услуга');
+  s += '<input class="inp" id="svName" placeholder="Название" value="'+h(e.name)+'">';
+  s += '<input class="inp" id="svPrice" placeholder="Цена, ₽" inputmode="numeric" value="'+h(String(e.price))+'">';
+  s += '<input class="inp" id="svDur" placeholder="Длительность, мин" inputmode="numeric" value="'+h(String(e.duration_min))+'">';
+  s += '<textarea class="inp" id="svDesc" rows="3" placeholder="Описание">'+h(e.description)+'</textarea>';
+  s += '<label class="chkrow"><input type="checkbox" id="svActive"'+(e.active?' checked':'')+'> Показывать клиентам</label>';
+  s += '<button class="abtn ok" style="width:100%;margin-top:14px" onclick="admSvSave()">💾 Сохранить</button>';
+  if (editSvc) s += '<button class="abtn no" style="width:100%;margin-top:8px" onclick="admSvDel()">🗑 Удалить услугу</button>';
+  return s;
+}
+function admSvSave(){
+  var body = { name:gv('svName'), price:gv('svPrice'), duration_min:gv('svDur'), description:gv('svDesc'), active: $('svActive').checked ? 1 : 0 };
+  if (editSvc) body.id = editSvc.id;
+  haptic('medium');
+  apiPost('/api/admin/service/save', body).then(function(d){
+    if (d.ok) { toast('💾 Сохранено'); editSvc=null; refreshAdmin(); refreshData(false); go('adm_sv'); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+function admSvDel(){
+  if (!editSvc || !confirm('Удалить услугу «'+editSvc.name+'»?')) return;
+  haptic('heavy');
+  apiPost('/api/admin/service/del', { id:editSvc.id }).then(function(d){
+    if (d.ok) { toast('🗑 Удалено'); editSvc=null; refreshAdmin(); refreshData(false); go('adm_sv'); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+
+var TEXT_KEYS = [
+  ['start_text','💬 Приветствие (/start)'],
+  ['about_text','🤍 О мастере'],
+  ['contacts_text','📍 Контакты'],
+  ['promo_text','🔥 Акция (пусто = скрыта)'],
+  ['portfolio_url','🖼 Ссылка на портфолио'],
+  ['master_link','💬 Ссылка «Написать мастеру»']
+];
+function viewAdminTx(){
+  var s = admHead('Тексты');
+  for (var i=0;i<TEXT_KEYS.length;i++)
+    s += '<div class="card menurow" onclick="editTextKey=\''+TEXT_KEYS[i][0]+'\';go(\'adm_tx_edit\')">'+TEXT_KEYS[i][1]+'<span style="color:var(--muted)">✏️</span></div>';
+  return s;
+}
+function viewAdminTxEdit(){
+  var label = editTextKey;
+  for (var i=0;i<TEXT_KEYS.length;i++) if (TEXT_KEYS[i][0]===editTextKey) label = TEXT_KEYS[i][1];
+  var s = admHead(label);
+  s += '<textarea class="inp" id="txVal" rows="7">'+h(AD.texts[editTextKey]||'')+'</textarea>';
+  s += '<div style="color:var(--muted);font-size:12px;margin-top:6px">Можно HTML-теги: &lt;b&gt; &lt;i&gt; &lt;code&gt;. Акция: пусто = скрыта.</div>';
+  s += '<button class="abtn ok" style="width:100%;margin-top:12px" onclick="admTxSave()">💾 Сохранить</button>';
+  return s;
+}
+function admTxSave(){
+  apiPost('/api/admin/text', { key:editTextKey, value: $('txVal').value }).then(function(d){
+    if (d.ok) { toast('💾 Сохранено'); refreshAdmin(); refreshData(false); go('adm_tx'); }
+    else toast(d.error || 'Ошибка 😔');
+  });
+}
+
+function viewAdminBc(){
+  var s = admHead('Рассылка · клиентов: '+AD.stats.users);
+  s += '<textarea class="inp" id="bcText" rows="6" placeholder="Текст сообщения всем клиентам... (можно HTML: <b>, <i>)"></textarea>';
+  s += '<button class="abtn ok" style="width:100%;margin-top:12px" onclick="admBcSend(this)">🚀 Отправить всем</button>';
+  s += '<div id="bcRes" style="margin-top:12px;color:var(--muted);font-size:13.5px;text-align:center"></div>';
+  return s;
+}
+function admBcSend(btnEl){
+  var t = gv('bcText');
+  if (!t) { toast('Напиши текст 🙈'); return; }
+  if (!confirm('Отправить ВСЕМ клиентам?')) return;
+  btnEl.disabled = true; btnEl.textContent = '⏳ Рассылаю...';
+  haptic('heavy');
+  apiPost('/api/admin/broadcast', { text:t }).then(function(d){
+    btnEl.disabled = false; btnEl.textContent = '🚀 Отправить всем';
+    if (d.ok) { $('bcRes').textContent = '✅ Доставлено: '+d.delivered+(d.failed?' · ❌ не доставлено: '+d.failed:''); toast('📣 Готово!'); }
+    else toast(d.error || 'Ошибка 😔');
   });
 }
 
@@ -1955,6 +2312,11 @@ export default {
       const initData = request.headers.get("X-Tg-Init-Data") || "";
       const user = await validateInitData(initData, env.BOT_TOKEN);
       if (!user) return json({ ok: false, error: "auth" }, 401);
+      if (url.pathname.startsWith("/api/admin/")) {
+        if (!isAdmin(env, user.id)) return json({ ok: false, error: "forbidden" }, 403);
+        const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
+        return apiAdmin(env, url.pathname, body);
+      }
       if (url.pathname === "/api/data") return apiData(env, user);
       if (url.pathname === "/api/book" && request.method === "POST")
         return apiBook(env, user, await request.json().catch(() => ({})));
