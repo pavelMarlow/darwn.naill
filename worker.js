@@ -327,7 +327,7 @@ async function screenAdminBookingCard(env, id) {
     text:
       `📋 <b>Запись #${b.id}</b> · ${st}\n\n` +
       `👤 Клиент: <b>${html(b.client_name)}</b> (${mention(b.client_username)})\n` +
-      (b.client_phone ? `📱 Телефон: <code>${html(b.client_phone)}</code>\n` : "") +
+      (b.client_phone ? `📱 Телефон: <code>${html(b.client_phone)}</code>\n` : "📱 Без номера телефона\n") +
       `💅 Услуга: ${html(b.service_name)} · ${b.price}₽\n` +
       `🗓 Когда: <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n` +
       `📲 Источник: ${b.source === "app" ? "Mini App" : "бот"}`,
@@ -401,7 +401,7 @@ async function screenAdminSlotCard(env, id) {
     text =
       `🔴 <b>Окошко занято</b>\n\n🗓 ${dateLabel(s.date)} в ${s.time}\n\n` +
       `👤 ${html(s.client_name || "")} (${mention(s.client_username)})\n` +
-      (s.client_phone ? `📱 <code>${html(s.client_phone)}</code>\n` : "") +
+      (s.client_phone ? `📱 <code>${html(s.client_phone)}</code>\n` : "📱 Без номера телефона\n") +
       `💅 ${html(s.service_name || "")}`;
     if (s.bid) rows.push([btn("📋 Открыть запись", `a:bk:${s.bid}`)]);
   }
@@ -495,7 +495,7 @@ async function notifyAdminNewBooking(env, b) {
   const text =
     "🔔 <b>Новая запись!</b>\n\n" +
     `👤 Клиент: <b>${html(b.client_name)}</b> (${mention(b.client_username)})\n` +
-    (b.client_phone ? `📱 Телефон: <code>${html(b.client_phone)}</code>\n` : "") +
+    (b.client_phone ? `📱 Телефон: <code>${html(b.client_phone)}</code>\n` : "📱 Без номера телефона\n") +
     `💅 Услуга: ${html(b.service_name)} · ${b.price}₽\n` +
     `🗓 Когда: <b>${dateLabel(b.date)}</b> в <b>${b.time}</b>\n` +
     `📲 Источник: ${b.source === "app" ? "Mini App" : "бот"}`;
@@ -915,10 +915,10 @@ async function apiReview(env, user, body) {
 
 async function apiBook(env, user, body) {
   const { slot_id, service_id, name, phone } = body || {};
-  if (!slot_id || !service_id || !name || String(name).trim().length < 2)
+  if (!slot_id || !service_id || !name || String(name).trim().length < 1)
     return json({ ok: false, error: "Заполни имя и выбери время 🙈" }, 400);
-  if (!phone || !/^[+]?[\d\s\-()]{10,18}$/.test(String(phone).trim()))
-    return json({ ok: false, error: "Оставь номер телефона 🙈" }, 400);
+  if (phone && !/^[+]?[\d\s\-()]{10,18}$/.test(String(phone).trim()))
+    return json({ ok: false, error: "Похоже, в телефоне опечатка 🙈" }, 400);
   const res = await createBooking(env, {
     userId: user.id, slotId: +slot_id, serviceId: +service_id,
     name: String(name).trim().slice(0, 40), phone: phone ? String(phone).trim() : "", source: "app",
@@ -1472,7 +1472,7 @@ function viewBook(){
   if (sel.slotId) {
     s += '<div class="sect">Как к тебе обращаться?</div>';
     s += '<input class="inp" id="inName" placeholder="Имя" value="'+h(form.name)+'" oninput="form.name=this.value;updCta()">';
-    s += '<input class="inp" id="inPhone" placeholder="Телефон*" value="'+h(form.phone)+'" oninput="form.phone=this.value;updCta()">';
+    s += '<input class="inp" id="inPhone" placeholder="Телефон (по желанию)" value="'+h(form.phone)+'" oninput="form.phone=this.value;updCta()">';
   }
   s += '<div style="height:76px"></div>';
   return s;
@@ -1500,7 +1500,7 @@ function renderCta(){
 function validPhone(p){ return /^[+]?[\d\s\-()]{10,18}$/.test(String(p||'').trim()); }
 function updCta(){
   var b = $('ctaBtn');
-  if (b) b.disabled = sending || form.name.trim().length < 2 || !validPhone(form.phone);
+  if (b) b.disabled = sending || form.name.trim().length < 1;
 }
 function go(v){ haptic(); view=v; render(); }
 function openSvc(id){
@@ -1514,8 +1514,8 @@ function pickSlot(id, t){ haptic('medium'); sel.slotId=id; sel.time=t; render();
 
 function submitBook(){
   if (sending) return;
-  if (form.name.trim().length < 2) { toast('Напиши имя 🙈'); return; }
-  if (!validPhone(form.phone)) { toast('Оставь номер телефона 🙈'); return; }
+  if (form.name.trim().length < 1) { toast('Напиши имя 🙈'); return; }
+  if (form.phone.trim() && !validPhone(form.phone)) { toast('Похоже, в телефоне опечатка 🙈'); return; }
   sending = true; updCta();
   haptic('heavy');
   var headers = { 'content-type':'application/json' };
@@ -1593,7 +1593,7 @@ function viewAdminBk(){
     var st = b.status==='confirmed' ? '<span class="st c">✅ подтверждена</span>' : '<span class="st p">⏳ ждёт</span>';
     s += '<div class="card"><div class="bk"><div><b>'+f.dd+' '+f.mo+' · '+b.time+'</b></div>'+st+'</div>';
     s += '<div style="color:var(--muted);font-size:13px;margin-top:6px">💅 '+h(b.service_name)+' · '+b.price+'₽</div>';
-    s += '<div style="color:var(--muted);font-size:13px;margin-top:3px">👤 '+h(b.client_name)+(b.client_username?' · @'+h(b.client_username):'')+(b.client_phone?' · '+h(b.client_phone):'')+'</div>';
+    s += '<div style="color:var(--muted);font-size:13px;margin-top:3px">👤 '+h(b.client_name)+(b.client_username?' · @'+h(b.client_username):'')+(b.client_phone?' · '+h(b.client_phone):' · без телефона')+'</div>';
     s += '<div style="display:flex;gap:8px;margin-top:10px">';
     if (b.status==='pending') s += '<button class="abtn ok" style="flex:1" onclick="admBk('+b.id+',\'confirm\')">✅ Подтвердить</button>';
     s += '<button class="abtn no" style="flex:1" onclick="admBk('+b.id+',\'cancel\')">'+(b.status==='pending'?'❌ Отклонить':'❌ Отменить')+'</button>';
