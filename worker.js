@@ -993,6 +993,7 @@ async function apiCancel(env, user, body) {
 // ────────────────────────── MINI APP: АДМИН-API ──────────────────────────
 async function apiAdmin(env, path, body) {
   const today = todayStr(env);
+  try {
   if (path === "/api/admin/data") {
     const bookings = (await env.DB.prepare(
       "SELECT * FROM bookings WHERE status IN ('pending','confirmed') AND date>=? ORDER BY date, time LIMIT 100"
@@ -1143,6 +1144,9 @@ async function apiAdmin(env, path, body) {
     return json({ ok: true, delivered: ok, failed: fail });
   }
   return json({ ok: false, error: "not_found" }, 404);
+  } catch (e) {
+    return json({ ok: false, error: "srv: " + String((e && e.message) || e).slice(0, 140) }, 200);
+  }
 }
 
 // ────────────────────────── MINI APP: HTML ──────────────────────────
@@ -1334,7 +1338,12 @@ var API_URL = '__API__';
 
 function apiPost(path, body){
   return fetch(API_URL+path, { method:'POST', headers:{ 'content-type':'application/json', 'X-Tg-Init-Data': tg.initData }, body: JSON.stringify(body||{}) })
-    .then(function(r){ return r.json(); })
+    .then(function(r){ return r.text().then(function(txt){
+      var j = null;
+      try { j = JSON.parse(txt); } catch(e) { return { ok:false, error:'HTTP '+r.status+': не-JSON ответ' }; }
+      if (!r.ok && j && !j.error) j.error = 'HTTP '+r.status;
+      return j;
+    }); })
     .catch(function(){ return { ok:false, error:'Нет связи 😔' }; });
 }
 function loadAdmin(cb){
@@ -2784,7 +2793,7 @@ export default {
     }
 
     // API мини-аппа
-    if (url.pathname.startsWith("/api/")) {
+    if (url.pathname.startsWith("/api/")) try {
       const initData = request.headers.get("X-Tg-Init-Data") || "";
       const user = await validateInitData(initData, env.BOT_TOKEN);
       if (!user) return json({ ok: false, error: "auth" }, 401);
@@ -2807,6 +2816,8 @@ export default {
         return json({ ok: true, kind: rows[0].kind, value: rows[0].value });
       }
       return json({ ok: false, error: "not_found" }, 404);
+    } catch (e) {
+      return json({ ok: false, error: "srv: " + String((e && e.message) || e).slice(0, 140) }, 200);
     }
 
     // Вебхук Telegram
