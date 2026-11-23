@@ -201,8 +201,11 @@ async function createBooking(env, { userId, slotId, serviceId, name, phone, sour
 async function cancelBooking(env, bookingId, byAdmin) {
   const b = await env.DB.prepare("SELECT * FROM bookings WHERE id=?").bind(bookingId).first();
   if (!b || b.status === "cancelled") return null;
-  await env.DB.prepare("UPDATE bookings SET status='cancelled' WHERE id=?").bind(bookingId).run();
-  if (b.slot_id) await env.DB.prepare("UPDATE slots SET status='free', booking_id=NULL WHERE id=?").bind(b.slot_id).run();
+  const slotId = b.slot_id;
+  // slot_id=NULL обязательно: иначе после удаления освободившегося окошка запись
+  // остаётся с висячей FK-ссылкой, и D1 отклоняет любой её UPDATE (FOREIGN KEY constraint failed)
+  await env.DB.prepare("UPDATE bookings SET status='cancelled', slot_id=NULL WHERE id=?").bind(bookingId).run();
+  if (slotId) await env.DB.prepare("UPDATE slots SET status='free', booking_id=NULL WHERE id=?").bind(slotId).run();
   return b;
 }
 
@@ -723,6 +726,7 @@ async function onCallback(env, cb, appUrl) {
   if (parts[1] === "sl" && parts[2] === "x") {
     const s = await env.DB.prepare("SELECT * FROM slots WHERE id=?").bind(+parts[3]).first();
     if (s && s.status === "free") {
+      await env.DB.prepare("UPDATE bookings SET slot_id=NULL WHERE slot_id=?").bind(s.id).run();
       await env.DB.prepare("DELETE FROM slots WHERE id=?").bind(+parts[3]).run();
       await answer(env, cb.id, `🗑 Окошко ${shortDate(s.date)} ${s.time} удалено`);
     } else await answer(env, cb.id, "Нельзя удалить занятое окошко", true);
@@ -736,6 +740,7 @@ async function onCallback(env, cb, appUrl) {
     });
   }
   if (data === "a:sl:clear:y") {
+    await env.DB.prepare("UPDATE bookings SET slot_id=NULL WHERE slot_id IN (SELECT id FROM slots WHERE status='free' AND date>=?)").bind(todayStr(env)).run();
     const r = await env.DB.prepare("DELETE FROM slots WHERE status='free' AND date>=?").bind(todayStr(env)).run();
     await answer(env, cb.id, `🧨 Удалено окошек: ${r.meta.changes}`, true);
     return show(env, c, await screenAdminSlots(env));
@@ -1073,10 +1078,12 @@ async function apiAdmin(env, path, body) {
     const s = await env.DB.prepare("SELECT * FROM slots WHERE id=?").bind(+body.id).first();
     if (!s) return json({ ok: false, error: "not_found" }, 404);
     if (s.status !== "free") return json({ ok: false, error: "slot_busy" }, 409);
+    await env.DB.prepare("UPDATE bookings SET slot_id=NULL WHERE slot_id=?").bind(s.id).run();
     await env.DB.prepare("DELETE FROM slots WHERE id=?").bind(s.id).run();
     return json({ ok: true });
   }
   if (path === "/api/admin/slots/clear") {
+    await env.DB.prepare("UPDATE bookings SET slot_id=NULL WHERE slot_id IN (SELECT id FROM slots WHERE status='free' AND date>=?)").bind(today).run();
     const r = await env.DB.prepare("DELETE FROM slots WHERE status='free' AND date>=?").bind(today).run();
     return json({ ok: true, deleted: r.meta.changes || 0 });
   }
@@ -2873,6 +2880,10 @@ export default {
         "ALTER TABLE bookings ADD COLUMN promo_code TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE bookings ADD COLUMN discount INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE bookings ADD COLUMN rebook_invited INTEGER NOT NULL DEFAULT 0",
+        // Лечим висячие FK-ссылки: записи, ссылающиеся на удалённые окошки/юзеров,
+        // из-за них D1 отклоняла любые UPDATE/DELETE (FOREIGN KEY constraint failed)
+        "UPDATE bookings SET slot_id=NULL WHERE slot_id IS NOT NULL AND slot_id NOT IN (SELECT id FROM slots)",
+        "INSERT OR IGNORE INTO users (telegram_id, first_name) SELECT DISTINCT user_id, 'клиент' FROM bookings WHERE user_id NOT IN (SELECT telegram_id FROM users)",
       ];
       const mig = [];
       for (const sql of MIGRATIONS) {

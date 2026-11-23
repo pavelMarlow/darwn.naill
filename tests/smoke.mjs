@@ -98,7 +98,12 @@ function q(sql, binds = []) {
   if (/^UPDATE promos SET active/.test(s)) { const p = T.promos.find((x) => x.id === binds[1]); if (p) p.active = binds[0]; return { meta: { changes: 1 } }; }
   if (/^DELETE FROM promos/.test(s)) { tables.promos = T.promos.filter((x) => x.id !== binds[0]); return { meta: { changes: 1 } }; }
   if (/^UPDATE users SET birthday/.test(s)) { const u = T.users.find((x) => x.telegram_id === binds[1]); if (u) u.birthday = binds[0]; return { meta: { changes: 1 } }; }
-  if (/^UPDATE bookings SET status='cancelled'/.test(s)) { const b = T.bookings.find((x) => x.id === binds[0]); if (b) b.status = "cancelled"; return { meta: { changes: 1 } }; }
+  if (/^UPDATE bookings SET status='cancelled'/.test(s)) { const b = T.bookings.find((x) => x.id === binds[0]); if (b) { b.status = "cancelled"; if (/slot_id=NULL/.test(s)) b.slot_id = null; } return { meta: { changes: 1 } }; }
+  if (/^UPDATE bookings SET slot_id=NULL WHERE slot_id=\?/.test(s)) { T.bookings.forEach((b) => { if (b.slot_id === binds[0]) b.slot_id = null; }); return { meta: { changes: 1 } }; }
+  if (/^UPDATE bookings SET slot_id=NULL WHERE slot_id IN/.test(s)) { T.bookings.forEach((b) => { const sl = T.slots.find((x) => x.id === b.slot_id); if (sl && sl.status === "free" && sl.date >= binds[0]) b.slot_id = null; }); return { meta: { changes: 1 } }; }
+  if (/^UPDATE bookings SET slot_id=NULL/.test(s)) return { meta: { changes: 1 } };
+  if (/^DELETE FROM slots WHERE id=\?/.test(s)) { const n = T.slots.length; tables.slots = T.slots.filter((x) => x.id !== binds[0]); return { meta: { changes: n - tables.slots.length } }; }
+  if (/^DELETE FROM slots WHERE status='free'/.test(s)) { const n = T.slots.length; tables.slots = T.slots.filter((x) => !(x.status === "free" && x.date >= binds[0])); return { meta: { changes: n - tables.slots.length } }; }
   if (/^UPDATE bookings SET status='confirmed'/.test(s)) { const b = T.bookings.find((x) => x.id === binds[0]); if (b) b.status = "confirmed"; return { meta: { changes: 1 } }; }
   if (/^UPDATE reviews SET visible/.test(s)) { const r = T.reviews.find((x) => x.id === binds[1]); if (r) r.visible = binds[0]; return { meta: { changes: 1 } }; }
   if (/^DELETE FROM reviews/.test(s)) { tables.reviews = T.reviews.filter((x) => x.id !== binds[0]); return { meta: { changes: 1 } }; }
@@ -205,6 +210,24 @@ const post = (path, body, uid = 111) => worker.fetch(new Request("https://x" + p
   t("admin booking non-admin 403", r3.status === 403);
 }
 
+// ── FK-защита: отмена отвязывает окошко, удаление окошка не падает ──
+{
+  const b50 = tables.bookings.find((b) => b.id === 50);
+  t("cancel отвязал slot_id", b50.slot_id == null);
+  const s12 = tables.slots.find((s) => s.id === 12);
+  t("окошко освобождено", s12 && s12.status === "free" && s12.booking_id == null);
+  // раньше тут падало: запись ссылалась на окошко → DELETE ловил FOREIGN KEY constraint failed
+  const r = await post("/api/admin/slot/del", { id: 12 });
+  const d = await r.json().catch(() => null);
+  t("slot/del после отмены ok", r.status === 200 && d && d.ok);
+  t("окошко удалено из БД", !tables.slots.some((s) => s.id === 12));
+  // удаление свободного окошка, на которое ещё ссылается запись → запись отвяжется
+  tables.slots.push({ id: 77, date: "2099-02-01", time: "10:00", status: "free", booking_id: null });
+  tables.bookings.push({ id: 60, user_id: 111, slot_id: 77, client_name: "Аня", service_name: "Маникюр", price: 1500, date: "2099-02-01", time: "10:00", status: "cancelled" });
+  const r2 = await post("/api/admin/slot/del", { id: 77 });
+  t("slot/del отвязал запись", r2.status === 200 && tables.bookings.find((b) => b.id === 60).slot_id == null);
+}
+
 // ── отзывы ──
 {
   const r = await post("/api/review", { booking_id: 5, rating: 5, text: "Супер!" });
@@ -259,7 +282,7 @@ const post = (path, body, uid = 111) => worker.fetch(new Request("https://x" + p
 {
   const r = await worker.fetch(new Request("https://x/setup/s", {}), env, { waitUntil() {} });
   const d = await r.json();
-  t("setup migrations x9", Array.isArray(d.migrations) && d.migrations.length === 9);
+  t("setup migrations x11", Array.isArray(d.migrations) && d.migrations.length === 11);
 }
 
 let fail = 0;
